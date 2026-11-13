@@ -18,15 +18,22 @@ Failure contract (locked decisions):
 - LLM call/parse failures ABSTAIN: Signal(value=0.0, metadata.abstained=True).
 - Every LLM decision persists its exact prompt + response (via PromptCache),
   and an unchanged snapshot never pays for a second LLM call.
+
+At a bar (a minute fund's session) the prompt also carries the day so far
+— the move since the previous close, results released, headlines — see
+features/intraday.py. It is bucketed so quiet bars stay cache hits.
 """
 
 from __future__ import annotations
 
 import logging
 
+from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.protocol import DataClient
+from hedge_fund.features.breakpoints import MEBreakpoints, shared_breakpoints
+from hedge_fund.features.intraday import build_intraday_context
 from hedge_fund.features.snapshot import FundamentalsSnapshot, InsufficientData, build_snapshot
-from hedge_fund.llm import LLMClient, PromptCache, extract_json, make_llm, prompt_key
+from hedge_fund.llm import LLMCallError, LLMClient, PromptCache, extract_json, make_llm, prompt_key
 from hedge_fund.models import Signal
 from hedge_fund.signals.base import AlphaModel
 
@@ -43,9 +50,19 @@ class LLMAgent(AlphaModel):
         self,
         llm: LLMClient | None = None,
         cache: PromptCache | None = None,
+        blind: bool = False,
+        breakpoints: MEBreakpoints | None = None,
     ) -> None:
         self._llm = llm if llm is not None else make_llm()
         self._cache = cache if cache is not None else PromptCache()
+        # Blind prompts withhold the ticker, industry, calendar dates and
+        # dollar values so a backtest can't lean on what the LLM remembers
+        # about the company (FundamentalsSnapshot.render). Size survives only
+        # as a market-cap percentile from a breakpoints table, loaded once per
+        # process on first use unless one is injected (tests). Backtests set
+        # blind; live runs don't and never touch the breakpoints.
+        self._blind = blind
+        self._breakpoints = breakpoints
 
     # ------------------------------------------------------------------
     # AlphaModel interface
@@ -60,17 +77,18 @@ class LLMAgent(AlphaModel):
 
         system = self.get_system_prompt()
         user = self.build_user_prompt(snapshot)
-        key = prompt_key(self.name, self._llm.model, system, user)
+        if is_intraday(date):
+            # A bar, not a close: add the day so far. Bucketed, so a quiet
+            # bar renders the same prompt as the last one and costs nothing.
+            context = build_intraday_context(ticker, date, data_client)
+            user = f"{user}\n\n{context.render(blind=self._blind)}"
+        cache_key = getattr(self._llm, "cache_key", None)
+        key = (cache_key(self.name, system, user) if callable(cache_key)
+               else prompt_key(self.name, self._llm.model, system, user))
 
         cached = self._cache.get(key)
         if cached is not None and "parsed" in cached:
             return self._to_signal(ticker, date, cached["parsed"], key, snapshot, cached=True)
-
-        try:
-            response = self._llm.complete(system, user)
-        except Exception as exc:
-            logger.warning("%s LLM call failed for %s@%s: %s", self.name, ticker, date, exc)
-            return self._abstain(ticker, date, f"LLM call failed: {exc}")
 
         record = {
             "agent": self.name,
@@ -80,9 +98,22 @@ class LLMAgent(AlphaModel):
             "snapshot_hash": snapshot.content_hash,
             "system": system,
             "user": user,
-            "response": response,
         }
 
+        try:
+            response = self._llm.complete(system, user)
+        except Exception as exc:
+            if isinstance(exc, LLMCallError) and exc.diagnostic_record is not None:
+                self._cache.put(key, {**record, "call_error": str(exc),
+                                      "diagnostics": exc.diagnostic_record})
+                signal = self._abstain(ticker, date, f"LLM call failed: {exc}")
+                signal.metadata["prompt_key"] = key
+            else:
+                signal = self._abstain(ticker, date, f"LLM call failed: {exc}")
+            logger.warning("%s LLM call failed for %s@%s: %s", self.name, ticker, date, exc)
+            return signal
+
+        record["response"] = response
         try:
             parsed = self._parse(response)
         except Exception as exc:
@@ -109,11 +140,16 @@ class LLMAgent(AlphaModel):
         (macro, news); when a second snapshot TYPE exists, extract the
         implicit interface (ticker/as_of/content_hash/render) into a
         Protocol — not before."""
-        return build_snapshot(ticker, date, data_client)
+        breakpoints = None
+        if self._blind:
+            if self._breakpoints is None:
+                self._breakpoints = shared_breakpoints()
+            breakpoints = self._breakpoints
+        return build_snapshot(ticker, date, data_client, breakpoints=breakpoints)
 
     def build_user_prompt(self, snapshot: FundamentalsSnapshot) -> str:
         """Default user prompt: the rendered snapshot. Override to enrich."""
-        return snapshot.render()
+        return snapshot.render(blind=self._blind)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -128,11 +164,16 @@ class LLMAgent(AlphaModel):
         confidence = float(data.get("confidence", 0))
         if not 0 <= confidence <= 100:
             raise ValueError(f"confidence out of range: {confidence}")
-        return {
+        parsed = {
             "signal": signal,
             "confidence": confidence,
             "reasoning": str(data.get("reasoning", "")),
         }
+        if "provider_metadata" in data:
+            if not isinstance(data["provider_metadata"], dict):
+                raise ValueError("provider_metadata must be an object")
+            parsed["provider_metadata"] = data["provider_metadata"]
+        return parsed
 
     def _to_signal(
         self,
@@ -158,6 +199,8 @@ class LLMAgent(AlphaModel):
                 "snapshot_hash": snapshot.content_hash,
                 "cached": cached,
                 "abstained": False,
+                **({"provider_metadata": parsed["provider_metadata"]}
+                   if "provider_metadata" in parsed else {}),
             },
         )
 

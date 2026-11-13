@@ -214,14 +214,33 @@ Bar > .bar--complete {
     padding: 2 2;
 }
 
+#select-history {
+    background: transparent;
+    height: auto;
+}
+
+/* The run list shows a cursor only while it is the active pane. Blurred, its
+   highlighted row looks like every other row, so the screen opens with one
+   cursor (on the mandate), not two. */
+#select-history > .option-list--option-highlighted {
+    background: transparent;
+    text-style: none;
+}
+
+#select-history:focus > .option-list--option-highlighted {
+    background: #0f2e1e;
+    color: #2bd97c;
+    text-style: bold;
+}
+
 /* ---------------- api key prompt ---------------- */
 
-KeyPromptScreen {
+KeyPromptScreen, DataKeyPromptScreen {
     align: center middle;
     background: #0b100e 70%;
 }
 
-#keyprompt {
+#keyprompt, #datakeyprompt {
     width: 72;
     max-width: 92%;
     height: auto;
@@ -236,6 +255,14 @@ KeyPromptScreen {
 
 #key-blurb {
     margin-bottom: 1;
+}
+
+#datakeyprompt .key-label {
+    margin-top: 1;
+}
+
+#datakeyprompt .key-note {
+    margin-top: 1;
 }
 
 /* ---------------- model picker ---------------- */
@@ -260,13 +287,14 @@ ModelPickerScreen {
 
 #picker-list {
     max-height: 20;
+    color: #d9e6e0;
 }
 
 /* ---------------- confirm delete ---------------- */
 
-/* Red border, and only here: this is the one screen where something is
-   destroyed. The dimmed backdrop keeps the fund list visible behind it. */
-ConfirmDeleteScreen {
+/* Red border, and only here: these are the screens where something is
+   destroyed. The dimmed backdrop keeps the screen behind visible. */
+ConfirmDeleteScreen, ConfirmWipeScreen {
     align: center middle;
     background: #0b100e 70%;
 }
@@ -288,24 +316,59 @@ ConfirmDeleteScreen {
     margin-bottom: 1;
 }
 
-/* ---------------- run today ---------------- */
+/* ---------------- paper: run confirm ---------------- */
 
-#run-ready {
+/* Green border: this is where the user says yes to a run. Same shape as
+   the delete prompt, so the two approval steps feel like siblings. */
+RunConfirmScreen {
     align: center middle;
+    background: #0b100e 70%;
 }
 
-#run-hero {
-    width: auto;
-    margin-bottom: 3;
+#run-confirm {
+    width: 72;
+    max-width: 90%;
+    height: auto;
+    padding: 1 3;
+    background: #101613;
+    border: round #2bd97c;
 }
 
-#run-menu {
-    width: 40;
+#run-q {
+    margin-bottom: 1;
 }
 
-#run-menu .hint {
-    text-align: center;
+#run-body {
+    margin-bottom: 1;
 }
+
+/* ---------------- paper: one fund ---------------- */
+
+#pf {
+    padding: 1 2;
+}
+
+#pf-head {
+    margin-bottom: 1;
+}
+
+#pf-status {
+    margin-bottom: 1;
+}
+
+/* The sessions browser takes whatever the numbers and the curve leave. */
+#pf-panes {
+    height: 1fr;
+    min-height: 8;
+    margin-top: 1;
+}
+
+#pf-sessions {
+    height: 1fr;
+    max-height: 100%;
+}
+
+/* ---------------- paper: tick ---------------- */
 
 #run-phase {
     margin-bottom: 1;
@@ -338,6 +401,12 @@ ConfirmDeleteScreen {
 #report-nav {
     height: 1fr;
     max-height: 100%;
+}
+
+/* The decisions rail carries a longer row (date, change, verdict, fills),
+   so it takes a few more cells than the signal rail. */
+#report-rail.wide {
+    width: 46;
 }
 
 #report-detail {
@@ -373,6 +442,23 @@ ConfirmDeleteScreen {
     width: 1fr;
 }
 
+#window-inputs {
+    height: auto;
+}
+
+#window-inputs Input {
+    width: 12;
+}
+
+.window-sep {
+    width: auto;
+    padding-top: 1;
+}
+
+#interval-line, #window-line {
+    margin-top: 1;
+}
+
 #stocks-preview {
     margin-top: 1;
 }
@@ -404,6 +490,11 @@ ConfirmDeleteScreen {
     margin-right: 1;
     text-align: center;
     content-align: center middle;
+}
+
+#scorecard {
+    height: auto;
+    margin-top: 1;
 }
 
 #curve-box {

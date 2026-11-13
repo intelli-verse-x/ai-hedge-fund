@@ -1,39 +1,86 @@
-"""FundSpec — a fund's mandate as data, and the Fund that lives it.
-
-The hierarchy mirrors a real shop (see VISION.md):
-
-    FUND      = capital slices over STRATEGIES  (master risk on the netted book)
-    STRATEGY  = a blend policy over MODELS      (a "pod")
-    MODEL     = an alpha model -> Signal
-
-Models come in two kinds, and the strategy's character follows from its
-staff: a strategy of LLM investor AGENTS (Buffett, Munger, ...) is a
-discretionary pod — its identity is who's on the desk; a strategy powered
-by quant models (PEAD, ...) is a systematic pod — its identity is the edge
-it harvests. Same spec shape, same engine slot; the kind is derived, never
-declared.
-
-Specs are data (a Loop-2 ground rule): a mandate is a serializable YAML/JSON
-config. The wizard, a chat LLM, and the strategy generator all emit this same
-format — nothing downstream ever needs to know who authored a fund.
-
-A `Fund` is the living counterpart: the spec plus its models instantiated
-once. Models are stateful (LLM prompt caches, PEAD earnings caches), so
-they must be constructed per fund — never per cycle — for caches to survive
-across cycles.
-"""
+"""Validated fund configurations, strategy composition, and model construction."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+    ValidationError,
+)
 
+from hedge_fund.brokers.costs import TradingCosts
 from hedge_fund.risk.limits import RiskLimits
-from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent, get_horizon_days, get_investment_approach
 from hedge_fund.signals.base import AlphaModel
+
+PortfolioMode: TypeAlias = Literal["long_only", "long_short", "dollar_neutral"]
+Cadence: TypeAlias = Literal["minute", "daily", "weekly", "monthly"]
+
+# The shortest interval a minute fund may run at: a session key is stamped
+# to the second, so one second is the finest bar there is. A snapshot round
+# trip is about a second per name, so at the fastest settings the runner
+# will miss bars (logged as gaps) rather than fall behind its clock.
+MIN_INTERVAL_SECONDS = 1
+
+# US extended hours: the earliest and latest a trading window may reach.
+EARLIEST_WINDOW = "04:00"
+LATEST_WINDOW = "20:00"
+
+
+def _clock_seconds(hhmm: str) -> int:
+    """Seconds since midnight for an HH:MM string; ValueError otherwise."""
+    try:
+        hours, minutes = hhmm.split(":")
+        h, m = int(hours), int(minutes)
+    except (AttributeError, ValueError):
+        raise ValueError(f"{hhmm!r} is not a time of day (HH:MM)") from None
+    if not (0 <= h < 24 and 0 <= m < 60 and len(hours) == 2 and len(minutes) == 2):
+        raise ValueError(f"{hhmm!r} is not a time of day (HH:MM)")
+    return h * 3600 + m * 60
+
+
+class TradingWindow(BaseModel):
+    """When a minute fund trades, in New York time. Both ends are sessions:
+    the window opens with a bar at `start` and always closes with one at `end`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: str = "09:30"
+    end: str = "16:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _within_extended_hours(cls, value: str) -> str:
+        seconds = _clock_seconds(value)
+        if not _clock_seconds(EARLIEST_WINDOW) <= seconds <= _clock_seconds(LATEST_WINDOW):
+            raise ValueError(f"{value} is outside US extended hours ({EARLIEST_WINDOW}–{LATEST_WINDOW} ET)")
+        return value
+
+    @model_validator(mode="after")
+    def _opens_before_it_closes(self) -> TradingWindow:
+        if self.start_seconds >= self.end_seconds:
+            raise ValueError(f"window must open before it closes ({self.start}–{self.end} ET)")
+        return self
+
+    @property
+    def start_seconds(self) -> int:
+        return _clock_seconds(self.start)
+
+    @property
+    def end_seconds(self) -> int:
+        return _clock_seconds(self.end)
+
+    @property
+    def label(self) -> str:
+        return f"{self.start}–{self.end} ET"
 
 
 class ModelSpec(BaseModel):
@@ -43,9 +90,14 @@ class ModelSpec(BaseModel):
 
     name: str = Field(description="key into ALPHA_MODEL_REGISTRY, e.g. 'buffett'")
     weight: float = Field(default=1.0, gt=0, description="blend weight")
-    params: dict[str, Any] = Field(
-        default_factory=dict, description="constructor kwargs for the model"
-    )
+    params: dict[str, Any] = Field(default_factory=dict, description="constructor kwargs for the model")
+
+    @field_validator("name")
+    @classmethod
+    def _declared_profile(cls, name: str) -> str:
+        get_investment_approach(name)
+        get_horizon_days(name)
+        return name
 
 
 class BlendPolicy(BaseModel):
@@ -54,15 +106,8 @@ class BlendPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     method: Literal["conviction_weighted"] = "conviction_weighted"
-    gross_target: float = Field(
-        default=1.0, gt=0, description="desired sum of |weights| when views exist"
-    )
-    market_neutral: bool = Field(
-        default=False,
-        description="demean convictions cross-sectionally before scaling: long "
-        "the best-liked names relative to the rest, short the least-liked — a "
-        "dollar-neutral sleeve",
-    )
+    gross_target: float = Field(default=1.0, gt=0, description="desired sum of |weights| when views exist")
+    mode: PortfolioMode
 
 
 class StrategySpec(BaseModel):
@@ -77,12 +122,10 @@ class StrategySpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    display_name: str | None = Field(
-        default=None, description="human-facing name, e.g. 'Deep Value'"
-    )
+    display_name: str | None = Field(default=None, description="human-facing name, e.g. 'Deep Value'")
     weight: float = Field(default=1.0, gt=0)
     models: list[ModelSpec] = Field(min_length=1)
-    blend: BlendPolicy = Field(default_factory=BlendPolicy)
+    blend: BlendPolicy
 
     @property
     def title(self) -> str:
@@ -95,34 +138,73 @@ class StrategySpec(BaseModel):
         return {m.name: m.weight for m in self.models}
 
 
-class FundSpec(BaseModel):
-    """A fund's complete mandate. `extra='forbid'` everywhere: YAML typos
-    fail loud at load time, not silently at trade time. `risk` is MASTER
-    risk — applied to the netted book after all strategies are combined.
+class AllocationPolicy(BaseModel):
+    """How the scorecard moves the mandate's weights: a confidence multiplier
+    on each strategy's capital slice and each model's blend weight.
 
-    Deliberately ticker-free: a mandate is the DESK — its strategies, staff,
-    risk limits, capital, and cadence — not a watchlist. Which names to trade
-    is a run-time input (see `normalize_universe` and `run_cycle`), exactly as
-    a real fund's mandate outlives any particular position.
+    `weight = mandate * clip(1 + slope * t, floor, cap)`, where t is the
+    analyst's IC t-stat or the sleeve's mean period return over its standard
+    deviation times sqrt(n). A t-stat pays for evidence of skill, not for one
+    lucky month; below `min_evidence` graded dates or periods the mandate
+    weight stands. The floor keeps a cut analyst producing graded views, so
+    it can earn its weight back. This is the multi-manager's rule for pods
+    and the quant desk's IC weighting for signals, shrunk to the mandate
+    while the record is short.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    min_evidence: int = Field(
+        default=20, ge=2, description="graded dates (analyst) or periods (strategy) before a weight moves"
+    )
+    slope: float = Field(default=0.25, ge=0, description="multiplier change per unit of t-stat")
+    floor: float = Field(default=0.25, gt=0, le=1, description="lowest multiplier")
+    cap: float = Field(default=2.0, ge=1, description="highest multiplier")
+
+    def multiplier(self, t_stat: float | None, n: int) -> float:
+        """What a mandate weight is multiplied by, given the evidence."""
+        if t_stat is None or n < self.min_evidence:
+            return 1.0
+        return min(self.cap, max(self.floor, 1 + self.slope * t_stat))
+
+
+class FundSpec(BaseModel):
+    """A mandate with fund-level risk limits and no fixed ticker universe.
+
+    Unknown fields are rejected. Risk limits apply to the combined portfolio;
+    the ticker universe is supplied separately for each run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2]
     name: str
     strategies: list[StrategySpec] = Field(min_length=1)
     risk: RiskLimits
+    costs: TradingCosts = Field(
+        default_factory=TradingCosts,
+        description="what every fill costs: half-spread per side and commission per share",
+    )
+    allocation: AllocationPolicy | None = Field(
+        default=None,
+        description="how the scorecard moves strategy slices and model weights; absent keeps every weight as written",
+    )
     capital: float = Field(default=100_000.0, gt=0)
-    rebalance: Literal["daily", "weekly", "monthly"] = Field(
+    rebalance: Cadence = Field(
         default="weekly",
-        description="how often the fund re-runs its cycle — a mandate choice, "
-        "not an engine constant: a fundamentals fund trades weekly, a "
-        "news-driven fund daily. The backtester (and the future daemon) obey "
-        "it; run_cycle itself never sees it.",
+        description="how often the fund decides: every bar (minute), or the first session of each day/week/month",
+    )
+    interval: float = Field(
+        default=1.0, gt=0,
+        description="minutes between sessions; read only when rebalance is minute",
+    )
+    window: TradingWindow = Field(
+        default_factory=TradingWindow,
+        description="trading hours in New York time; read only when rebalance is minute",
     )
     benchmark: str = Field(
         default="SPY",
-        description="what the fund measures itself against; also the source "
-        "of the backtest's trading-day grid",
+        description="what the fund measures itself against; also the source " "of the backtest's trading-day grid",
     )
 
     @field_validator("benchmark")
@@ -139,13 +221,77 @@ class FundSpec(BaseModel):
             raise ValueError(f"duplicate strategy names: {sorted(duplicates)}")
         return strategies
 
+    @model_validator(mode="after")
+    def _interval_and_window_belong_to_minute_funds(self) -> FundSpec:
+        if self.rebalance != "minute":
+            stray = sorted({"interval", "window"} & self.model_fields_set)
+            if stray:
+                raise ValueError(f"{', '.join(stray)}: only a minute fund has these; this one is {self.rebalance}")
+            return self
+        if self.interval_seconds < MIN_INTERVAL_SECONDS:
+            raise ValueError(
+                f"interval: floor is {MIN_INTERVAL_SECONDS} second — sessions are stamped to the second"
+            )
+        if self.interval_seconds > self.window.end_seconds - self.window.start_seconds:
+            raise ValueError(
+                f"interval: {format_interval(self.interval_seconds)} is longer than the {self.window.label} window"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        """Daily/weekly/monthly mandates serialize exactly as they did before
+        minute funds existed: `interval` and `window` mean nothing to them,
+        and every ledger record carries a serialized spec in its hash. For
+        the same reason a mandate at the default costs serializes without a
+        `costs` block, as every mandate did before costs existed."""
+        data = handler(self)
+        if self.rebalance != "minute":
+            data.pop("interval", None)
+            data.pop("window", None)
+        if self.costs == TradingCosts():
+            data.pop("costs", None)
+        if self.allocation is None:
+            data.pop("allocation", None)
+        return data
+
+    @property
+    def is_intraday(self) -> bool:
+        return self.rebalance == "minute"
+
+    @property
+    def interval_seconds(self) -> int:
+        """The bar length, to the second. Only meaningful for a minute fund."""
+        return int(round(self.interval * 60))
+
+    @property
+    def cadence_label(self) -> str:
+        """How the cadence reads: `daily`, or `every 30s` / `every 5m` / `every 1h30m`."""
+        if not self.is_intraday:
+            return self.rebalance
+        return f"every {format_interval(self.interval_seconds)}"
+
+
+def format_interval(seconds: int) -> str:
+    """`30s`, `5m`, `1h`, `1h30m`, `2m30s` — the shortest honest spelling."""
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if seconds < 60:
+        return f"{secs}s"
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs:
+        parts.append(f"{secs}s")
+    return "".join(parts)
+
 
 def normalize_universe(tickers: list[str]) -> list[str]:
-    """Clean a run's ticker list: upper-cased, de-duped, order preserved.
+    """Strip, uppercase, and deduplicate tickers while preserving their order.
 
-    The single normalizer for every entry point (CLI flag, TUI input, a future
-    API), so what the engine trades can't drift by caller. Empty raises: a
-    cycle with nothing to trade is a caller mistake, not an empty result.
+    Raise ValueError if no nonempty tickers remain.
     """
     universe: list[str] = []
     for ticker in tickers:
@@ -158,40 +304,67 @@ def normalize_universe(tickers: list[str]) -> list[str]:
 
 
 def load_spec(path: str | Path) -> FundSpec:
-    """Load a mandate from YAML. Validation errors carry the pydantic detail."""
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    # Mandates used to carry a `universe`. Tickers are a run-time input now
-    # (see FundSpec), so drop the legacy key rather than fail extra='forbid'
-    # on funds saved by an older build.
-    data.pop("universe", None)
-    return FundSpec(**data)
+    """Load a YAML mandate, raising ValueError with its path and error details."""
+    data = _read_yaml(path)
+    if "schema_version" not in data:
+        raise ValueError(f"{path}: schema_version: This fund uses an older format. " "Recreate it or update its configuration.")
+    try:
+        return FundSpec.model_validate(data)
+    except ValidationError as exc:
+        raise ValueError(_validation_message(path, exc)) from exc
 
 
 def load_strategy(path: str | Path) -> StrategySpec:
     """Load one strategy (a library file under hedge_fund/strategies/) from YAML."""
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    return StrategySpec(**data)
+    try:
+        return StrategySpec.model_validate(_read_yaml(path))
+    except ValidationError as exc:
+        raise ValueError(_validation_message(path, exc)) from exc
+
+
+def _validation_message(path: str | Path, exc: ValidationError) -> str:
+    errors = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+    return f"{path}: {errors}"
+
+
+def _read_yaml(path: str | Path) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(Path(path).read_text())
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"{path}: cannot read configuration: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: configuration must be a YAML mapping")
+    return data
+
+
+def custom_strategy(names: list[str]) -> StrategySpec:
+    """Build a strategy with its mode derived from registered analyst profiles.
+
+    Duplicate names are removed in selection order. Any analyst that permits
+    shorting enables long/short mode; dollar neutrality is never inferred.
+    Invalid or empty selections raise ValueError.
+    """
+    models = [ModelSpec(name=n) for n in dict.fromkeys(names)]
+    mode: PortfolioMode = "long_short" if any(get_investment_approach(m.name) == "long_short" for m in models) else "long_only"
+    return StrategySpec(name="custom", models=models, blend=BlendPolicy(mode=mode))
 
 
 class Fund:
-    """A living fund: its spec plus instantiated models, per strategy.
+    """A validated mandate with persistent model instances for each strategy.
 
-    Plain class, not pydantic — models hold state (LLM clients, prompt
-    caches, per-ticker data caches) and are constructed exactly once here.
-    A persona appearing in two strategies gets two instances; that's fine —
-    the prompt cache is disk-keyed by prompt content and shared, so the
-    second instance's calls are cache hits, not spend.
+    Models are constructed once so their caches survive successive cycles.
+    Callers may supply instances keyed by strategy name, including test doubles.
 
-    The `models` override (strategy name -> instances) exists for tests to
-    inject fakes; production callers let the registry build the staff.
+    `blind=True` is for backtests: the LLM agents render prompts without
+    the ticker, industry or calendar dates, so the result can't lean on
+    what the model remembers about the company. Quant models are unaffected.
     """
 
     def __init__(
         self,
         spec: FundSpec,
         models: dict[str, list[AlphaModel]] | None = None,
+        blind: bool = False,
     ) -> None:
         self.spec = spec
         self.strategies: list[tuple[StrategySpec, list[AlphaModel]]] = []
@@ -202,9 +375,8 @@ class Fund:
             staff = []
             for m in strategy.models:
                 if m.name not in ALPHA_MODEL_REGISTRY:
-                    raise ValueError(
-                        f"unknown model {m.name!r} in strategy "
-                        f"{strategy.name!r}; available: {sorted(ALPHA_MODEL_REGISTRY)}"
-                    )
-                staff.append(ALPHA_MODEL_REGISTRY[m.name](**m.params))
+                    raise ValueError(f"unknown model {m.name!r} in strategy " f"{strategy.name!r}; available: {sorted(ALPHA_MODEL_REGISTRY)}")
+                cls = ALPHA_MODEL_REGISTRY[m.name]
+                params = {**m.params, "blind": True} if blind and issubclass(cls, LLMAgent) else m.params
+                staff.append(cls(**params))
             self.strategies.append((strategy, staff))
