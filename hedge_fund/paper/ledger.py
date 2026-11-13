@@ -87,6 +87,12 @@ class Ledger:
         return sorted({session_date(s) for s in self.sessions()})
 
     def path(self, session: str) -> Path:
+        if not isinstance(session, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?", session):
+            raise LedgerError("session must be a calendar date or a New York bar key")
+        try:
+            datetime.fromisoformat(session)
+        except ValueError as exc:
+            raise LedgerError("session has an invalid calendar date or clock time") from exc
         if is_intraday(session):
             return self.records_dir / session_date(session) / f"{session[11:].replace(':', '')}.json"
         return self.records_dir / f"{session}.json"

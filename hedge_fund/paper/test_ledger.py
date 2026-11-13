@@ -230,3 +230,18 @@ def test_concurrent_append_cannot_commit_two_branches(tmp_path):
         first.result(timeout=5)
     assert ledger.sessions() == [MONDAY[0]]
     assert ledger.replay(100_000, full=True).last_session == MONDAY[0]
+
+
+@pytest.mark.parametrize("session", [
+    "../../outside", "/tmp/outside", "2026-10-05T../../outside", "2026-10-05T09:30:00/../../outside",
+    "2026-99-05", "2026-02-30", "2026-10-05T25:30:00", "2026-10-05T09:30:00Z",
+])
+def test_invalid_session_cannot_create_a_ledger_path_or_write_data(tmp_path, session):
+    ledger = Ledger(tmp_path / "fund")
+    ledger.init()
+    record = _bar(session)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    with pytest.raises(LedgerError, match="session"):
+        ledger.append(record)
+    assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
+    assert ledger.sessions() == []
