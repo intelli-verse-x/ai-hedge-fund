@@ -41,8 +41,11 @@ def test_picker_and_masked_key_save_or_cancel(save, isolated_configuration):
             assert isinstance(app.screen, home.HomeScreen)
             if save:
                 assert os.environ["TYPESAFE_API_KEY"] == entry.value
-                assert saved.read_text() == original + f"TYPESAFE_API_KEY={entry.value}\n"
-                assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+                if os.name == "nt":
+                    assert saved.read_text() == original
+                else:
+                    assert saved.read_text() == original + f"TYPESAFE_API_KEY={entry.value}\n"
+                    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
             else:
                 assert "TYPESAFE_API_KEY" not in os.environ
                 assert saved.read_text() == original
@@ -79,8 +82,11 @@ def test_data_credential_gate_takes_a_key_or_a_wallet(monkeypatch, isolated_conf
             await pilot.press("enter")
             resumed.assert_called_once()
             assert os.environ[env_var] == "fixture-secret-value"
-            assert isolated_configuration.read_text() == f"{env_var}=fixture-secret-value\n"
-            assert stat.S_IMODE(isolated_configuration.stat().st_mode) == 0o600
+            if os.name == "nt":
+                assert not isolated_configuration.exists()
+            else:
+                assert isolated_configuration.read_text() == f"{env_var}=fixture-secret-value\n"
+                assert stat.S_IMODE(isolated_configuration.stat().st_mode) == 0o600
             assert home.demand_run_keys(app, resumed) is True
 
     asyncio.run(scenario())
@@ -154,3 +160,14 @@ def test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds():
             await pilot.press("enter")
             assert isinstance(app.screen, funds.FundSelectScreen)
     asyncio.run(scenario())
+
+
+def test_windows_session_only_never_creates_or_edits_a_credential_file(monkeypatch, isolated_configuration):
+    monkeypatch.setattr(keys, "can_persist_credentials", lambda: False)
+    assert keys.save_credential("TYPESAFE_API_KEY", "synthetic-first") is None
+    assert not isolated_configuration.exists()
+    isolated_configuration.write_text("UNRELATED_KEY=unchanged\n")
+    assert keys.save_credential("TYPESAFE_API_KEY", "synthetic-second") is None
+    assert isolated_configuration.read_text() == "UNRELATED_KEY=unchanged\n"
+    assert os.environ["TYPESAFE_API_KEY"] == "synthetic-second"
+    assert "not saved to disk" in keys.credential_storage_description()

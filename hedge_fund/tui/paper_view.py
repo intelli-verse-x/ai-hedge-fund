@@ -240,7 +240,7 @@ def live_rows(
     today = today or datetime.now(NEW_YORK).date().isoformat()
     stale = oldest.date().isoformat() < today
     tone = MUTED if stale else GREEN if change >= 0 else RED
-    when = oldest.strftime("%b %-d %H:%M") if stale else oldest.strftime("%H:%M")
+    when = f"{oldest:%b} {oldest.day} {oldest:%H:%M}" if stale else oldest.strftime("%H:%M")
     return [("Live", Text.assemble(
         (f"${value:,.0f}", MUTED if stale else TEXT),
         (f"   {change:+.2%}", tone),

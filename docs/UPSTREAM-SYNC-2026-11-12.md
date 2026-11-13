@@ -12,7 +12,15 @@ The current supported CLI is `aihf backtest MANDATE --universe ...` and `aihf pa
 
 The candidate includes regression repairs for invalid cost-adjusted fills, checkpoint-cache corruption detection, cooperative writer ownership, safe runner stop requests, provider-origin pagination, stale mixed-age quote display, intraday daily-data eligibility, finite configuration and saved-mandate filename containment. Review the final PR diff and exact-commit CI for the final list and results. A checkpoint checksum detects changed bytes; it does not authenticate a writer or prevent a malicious same-user recomputation.
 
-The quality workflow uses ordinary hosted Linux and Windows runners with read-only GitHub permissions. Dependency installation is separate from tests. Provider/wallet credentials are blank, dotenv loading is explicitly disabled before test imports, and Python socket connections during tests are limited to loopback/Unix event-loop support. Test fakes exercise synthetic data and books. Live provider smoke tests remain skipped. No pipeline deploys an application, publishes a package, calls a trading broker or moves funds.
+The quality workflow uses ordinary hosted Linux and Windows runners with read-only GitHub permissions. Dependency installation is separate from tests. Provider/wallet credentials are blank, dotenv auto-discovery and user/repository files are denied while explicit temporary test fixtures are allowed, and Python socket connections during tests are limited to loopback/Unix event-loop support. Test fakes exercise synthetic data and books. Live provider smoke tests remain skipped. No pipeline deploys an application, publishes a package, calls a trading broker or moves funds.
+
+## Platform behavior
+
+Runner liveness on Windows uses a non-signaling process-handle query. A POSIX zero-signal probe is unsafe there because zero represents a console control event. Runner stop remains a cooperative token-bound request; acknowledgement does not prove the process has exited.
+
+On Windows, credentials entered through the TUI are kept only in the current process environment. They are not written to or merged into an existing credential file, and must be supplied again at the next independent launch. A reviewed Windows ACL or OS-vault persistence adapter is not implemented. On POSIX, saving uses an owner-readable/writable (0600) temporary file before writing secret bytes, flushes it, and atomically replaces the credential file; failed writes preserve the previous file and environment.
+
+Redo preserves a superseded ledger record before removing it from the live chain. An existing byte-identical archive can be reused; a conflicting archive stops the operation and retains both records for inspection. Archive integrity remains distinct from authenticated provenance.
 
 ## Limits requiring separate evidence
 
