@@ -149,6 +149,39 @@ def test_real_stop_runner_never_sends_a_signal(tmp_path):
     assert touched == [(tmp_path,1234)]
 
 
+def test_windows_liveness_never_calls_os_kill(tmp_path):
+    touched = []
+    check = _actual_function("paper/runner.py", "is_running", dict(
+        _read_pid=lambda directory:1234, sys=SimpleNamespace(platform="win32"),
+        _windows_pid_alive=lambda pid:touched.append(pid) or True,
+        os=SimpleNamespace(kill=lambda *args:pytest.fail("Windows signal sent"))))
+    assert check(tmp_path)
+    assert touched == [1234]
+
+
+@pytest.mark.parametrize("handle,wait,error,expected", [
+    (123,258,0,True), (123,0,0,False), (123,0xFFFFFFFF,6,True),
+    (None,0,87,False), (None,0,5,True), (None,0,6,True),
+])
+def test_windows_process_query_closes_handles_without_signals(monkeypatch, handle, wait, error, expected):
+    import ctypes
+    from unittest.mock import Mock
+    kernel = SimpleNamespace(OpenProcess=Mock(return_value=handle),
+                             WaitForSingleObject=Mock(return_value=wait),
+                             CloseHandle=Mock(return_value=True))
+    monkeypatch.setattr(ctypes, "WinDLL", Mock(return_value=kernel), raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda:error, raising=False)
+    check = _actual_function("paper/runner.py", "_windows_pid_alive", {})
+    assert check(1234) is expected
+    kernel.OpenProcess.assert_called_once_with(0x00100000, False, 1234)
+    if handle:
+        kernel.WaitForSingleObject.assert_called_once_with(handle, 0)
+        kernel.CloseHandle.assert_called_once_with(handle)
+    else:
+        kernel.WaitForSingleObject.assert_not_called()
+        kernel.CloseHandle.assert_not_called()
+
+
 def test_real_serve_observes_cooperative_stop_without_os_signals(tmp_path):
     directory = tmp_path / "fund"
     directory.mkdir()

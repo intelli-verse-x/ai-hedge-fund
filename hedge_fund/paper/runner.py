@@ -236,6 +236,8 @@ def is_running(directory: str | Path) -> bool:
     pid = _read_pid(directory)
     if pid is None:
         return False
+    if sys.platform == "win32":
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -243,6 +245,31 @@ def is_running(directory: str | Path) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Query a process handle without sending Windows CTRL_C_EVENT (zero).
+
+    Access denial or an inconclusive wait conservatively counts as running;
+    uncertainty must not authorize a competing writer.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only
+    if not handle:
+        return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no PID
+    try:
+        return kernel.WaitForSingleObject(handle, 0) != 0  # signaled == exited
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def stop_runner(directory: str | Path) -> bool:

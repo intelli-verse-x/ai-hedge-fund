@@ -250,7 +250,9 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
     def quick(directory, data, *, stop, **kwargs):
         seen["pid"] = int((directory / PID_FILE).read_text())
         seen["running"] = is_running(directory)
-        threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+        # Invoke the actual registered handler without an OS signal: Windows
+        # os.kill(SIGTERM) terminates the process instead of calling it.
+        threading.Timer(0.05, lambda: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)).start()
         seen["stopped"] = stop.wait(5)
     monkeypatch.setattr(runner, "run", quick)
 
