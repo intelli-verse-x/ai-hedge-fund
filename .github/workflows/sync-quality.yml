@@ -36,6 +36,8 @@ jobs:
       TYPESAFE_API_KEY: ''
       HEDGE_FUND_LLM_MODEL: ''
       PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
       POETRY_VIRTUALENVS_IN_PROJECT: 'true'
     steps:
       - uses: actions/checkout@v4
@@ -54,9 +56,7 @@ jobs:
       - name: Test without provider credentials or external sockets
         # Loopback/Unix sockets support local event loops; no Internet hosts
         # are allowed during tests. Live data smoke tests remain skipped.
-        # Explicitly disable dotenv before test/conftest imports; pinned
-        # python-dotenv 1.0 predates PYTHON_DOTENV_DISABLED support.
-        run: >-
-          poetry run python -c "import dotenv; dotenv.load_dotenv = lambda *a, **kw: False; import pytest; raise SystemExit(pytest.main(['hedge_fund/', '--disable-socket', '--allow-unix-socket', '--allow-hosts=127.0.0.1,::1', '--junitxml=sync-test-results.xml']))"
+        # Dotenv is allowed only inside fresh pytest fixture storage.
+        run: poetry run python scripts/run-offline-tests.py
       - name: Build distribution
         run: poetry build
