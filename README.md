@@ -37,7 +37,7 @@ aihf
 
 ### API keys
 
-The app asks for keys the first time it needs them and saves them to `~/.hedge-fund/.env` — nothing to configure up front. It needs:
+The app asks for keys the first time it needs them. On POSIX systems it saves them privately to `~/.hedge-fund/.env`. On Windows, entered keys stay in the current process environment and must be supplied again at the next independent launch; Windows file persistence requires a future reviewed ACL or OS-vault adapter. See [platform behavior](docs/UPSTREAM-SYNC-2026-11-12.md#platform-behavior) for details. It needs:
 
 - A [Financial Datasets](https://financialdatasets.ai) API key, for prices, fundamentals, and earnings. Or, instead of a key, the private key of a Base wallet holding USDC: every call then pays for itself with [x402](https://docs.financialdatasets.ai/x402) (`pip install 'aihf[x402]'`; last 365 days of data, non-professional use).
 - One model API key for the investor agents. Supported providers: Anthropic, OpenAI, DeepSeek, Google, xAI, Kimi, TypeSafe (Jev).
