@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,13 +38,33 @@ def apply_credentials() -> None:
     load_dotenv(ENV_PATH, override=False)
 
 
-def save_credential(env_var: str, value: str) -> Path:
+def can_persist_credentials() -> bool:
+    """POSIX mode bits do not enforce a private Windows DACL."""
+    return os.name != "nt"
+
+
+def credential_storage_description() -> str:
+    if not can_persist_credentials():
+        return ("kept only in this process on Windows. It is not saved to disk; "
+                "set the environment again at the next launch.")
+    return f"saved to {ENV_PATH}, owner-readable/writable (0600), and loaded on later starts."
+
+
+def save_credential(env_var: str, value: str) -> Path | None:
     """Write one key into .env, replacing its line if present and appending
-    otherwise, then export it for this process. Returns the file it wrote.
+    otherwise, then export it for this process. Returns the private POSIX file,
+    or None for Windows process-only storage. Existing Windows files are not edited.
 
     Everything else in the file survives untouched — this is a line edit, not
     a regenerate.
     """
+    if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", env_var):
+        raise ValueError("invalid credential environment variable")
+    if not can_persist_credentials():
+        # A reviewed Windows ACL/vault adapter is not implemented. Keep the
+        # session usable without writing a falsely 'private' plaintext file.
+        os.environ[env_var] = value
+        return None
     line = f"{env_var}={_quote(value)}"
     if ENV_PATH.exists():
         original = ENV_PATH.read_text()
@@ -59,8 +80,18 @@ def save_credential(env_var: str, value: str) -> Path:
     else:
         updated = f"{line}\n"
 
-    ENV_PATH.write_text(updated)
-    ENV_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600 — secrets are not world-readable
+    # The temporary file is private before the first secret byte is written.
+    fd, temporary_name = tempfile.mkstemp(prefix=".credential-", dir=ENV_PATH.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), stat.S_IRUSR | stat.S_IWUSR)
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(ENV_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
     os.environ[env_var] = value
     return ENV_PATH
 

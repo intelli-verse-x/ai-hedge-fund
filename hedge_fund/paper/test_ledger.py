@@ -245,3 +245,32 @@ def test_invalid_session_cannot_create_a_ledger_path_or_write_data(tmp_path, ses
         ledger.append(record)
     assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
     assert ledger.sessions() == []
+
+
+def test_rewind_reuses_identical_archive_without_os_specific_overwrite(tmp_path):
+    ledger = Ledger(tmp_path)
+    record = _chain(MONDAY[:1])[0]
+    ledger.append(record)
+    raw = ledger.path(record.session).read_bytes()
+    ledger.rewind()
+    ledger.append(record)
+    assert ledger.rewind() == record
+    assert ledger.sessions() == []
+    archives = list((ledger.records_dir / "superseded").glob("*.json"))
+    assert len(archives) == 1 and archives[0].read_bytes() == raw
+
+
+def test_rewind_rejects_conflicting_archive_and_retains_both_files(tmp_path):
+    ledger = Ledger(tmp_path)
+    record = _chain(MONDAY[:1])[0]
+    ledger.append(record)
+    source = ledger.path(record.session)
+    raw = source.read_bytes()
+    keep = ledger.records_dir / "superseded"
+    keep.mkdir()
+    archive = keep / f"{record.session.replace(':', '')}.{record.hash[:12]}.json"
+    archive.write_bytes(b"different archived bytes")
+    with pytest.raises(LedgerError, match="archive collision"):
+        ledger.rewind()
+    assert source.read_bytes() == raw
+    assert archive.read_bytes() == b"different archived bytes"

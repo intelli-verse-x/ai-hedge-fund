@@ -25,11 +25,9 @@ venv/
 ENV/
 
 # Environment Variables
-.env
 
 # IDE
 .idea/
-.vscode/
 .cursor/
 *.swp
 *.swo
@@ -61,3 +59,5 @@ outputs/
 
 # Local-only release tooling
 scripts/release.sh
+config.bat
+node_modules

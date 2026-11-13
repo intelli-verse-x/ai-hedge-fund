@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -149,7 +150,7 @@ class Ledger:
         keep = self.records_dir / SUPERSEDED_SUBDIR
         keep.mkdir(exist_ok=True)
         safe = latest.session.replace(":", "")
-        self.path(latest.session).rename(keep / f"{safe}.{latest.hash[:12]}.json")
+        _archive_for_rewind(self.path(latest.session), keep / f"{safe}.{latest.hash[:12]}.json")
         checkpoint = self.checkpoint_path(session_date(latest.session))
         if checkpoint.exists():
             checkpoint.unlink()
@@ -291,3 +292,28 @@ def _checkpoint_digest(data: dict) -> str:
     """Canonical cache integrity checksum, never an authorization signature."""
     encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _archive_for_rewind(source: Path, destination: Path) -> None:
+    """Keep an exact record before removing it; never overwrite another archive.
+
+    A redo can reproduce the same session/hash. An already identical archive is
+    reusable on every OS. A different or partial archive blocks the rewind and
+    leaves the live chain untouched. A crash after copying is safely retryable.
+    """
+    raw = source.read_bytes()
+    try:
+        archive = destination.open("xb")
+    except FileExistsError:
+        if destination.read_bytes() != raw:
+            raise LedgerError("superseded archive collision; live record retained")
+    else:
+        try:
+            with archive:
+                archive.write(raw)
+                archive.flush()
+                os.fsync(archive.fileno())
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+    source.unlink()

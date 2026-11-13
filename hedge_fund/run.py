@@ -51,6 +51,9 @@ or given per study (backtest).
 
 from __future__ import annotations
 
+import utils.http_session
+import utils.transport
+import utils.session
 import argparse
 import os
 import sys

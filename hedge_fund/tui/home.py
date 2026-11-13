@@ -16,7 +16,7 @@ from textual.widgets.option_list import Option
 from hedge_fund import paths
 from hedge_fund.data.client import API_KEY_ENV, has_data_credential, WALLET_KEY_ENV
 from hedge_fund.llm import is_supported, load_api_models, provider_for
-from hedge_fund.tui.keys import masked, missing_key, PROVIDER_ENV_VARS, save_credential
+from hedge_fund.tui.keys import masked, missing_key, PROVIDER_ENV_VARS, save_credential, credential_storage_description
 from hedge_fund.tui.palette import BRIGHT, GREEN, MUTED, TEXT
 from hedge_fund.tui.shared import DEFAULT_MODEL_LABEL
 
@@ -143,11 +143,8 @@ class KeyPromptScreen(ModalScreen[bool]):
                 (f"{self._provider} API key needed", f"bold {BRIGHT}")),
                 id="key-q")
             yield Static(Text.assemble(
-                ("The fund cannot run without it. Paste it below and it "
-                 "is saved to\n", MUTED),
-                (str(paths.ENV_PATH), TEXT),
-                ("\nwhich is owner-read-only and loaded automatically on "
-                 "every start.", MUTED)),
+                ("The fund cannot run without it. Paste it below and it is "
+                 + credential_storage_description(), MUTED)),
                 id="key-blurb")
             yield Input(password=True, placeholder=self._env_var, id="key-input")
             yield Static(Text.assemble(
@@ -165,8 +162,13 @@ class KeyPromptScreen(ModalScreen[bool]):
         if not key:
             self.notify("No key entered", severity="warning")
             return
-        path = save_credential(self._env_var, key)
-        self.notify(f"Saved {self._env_var} ({masked(key)}) to {path}")
+        try:
+            path = save_credential(self._env_var, key)
+        except OSError:
+            self.notify("Could not save credential; no success was recorded.", severity="error")
+            return
+        location = f"to {path}" if path is not None else "for this process only (not saved to disk)"
+        self.notify(f"Set {self._env_var} ({masked(key)}) {location}")
         self.dismiss(True)
 
     def action_cancel(self) -> None:
@@ -189,11 +191,8 @@ class DataKeyPromptScreen(ModalScreen[bool]):
                 ("Financial Datasets credential needed", f"bold {BRIGHT}")),
                 id="key-q")
             yield Static(Text.assemble(
-                ("The fund cannot run without one. Paste either below and it "
-                 "is saved to\n", MUTED),
-                (str(paths.ENV_PATH), TEXT),
-                ("\nwhich is owner-read-only and loaded automatically on "
-                 "every start.", MUTED)),
+                ("The fund cannot run without one. Paste either below and it is "
+                 + credential_storage_description(), MUTED)),
                 id="key-blurb")
             yield Static(Text.assemble(
                 ("API key", f"bold {TEXT}"),
@@ -231,8 +230,13 @@ class DataKeyPromptScreen(ModalScreen[bool]):
         if not key:
             self.notify("No key entered", severity="warning")
             return
-        path = save_credential(env_var, key)
-        self.notify(f"Saved {env_var} ({masked(key)}) to {path}")
+        try:
+            path = save_credential(env_var, key)
+        except OSError:
+            self.notify("Could not save credential; no success was recorded.", severity="error")
+            return
+        location = f"to {path}" if path is not None else "for this process only (not saved to disk)"
+        self.notify(f"Set {env_var} ({masked(key)}) {location}")
         self.dismiss(True)
 
     def action_cancel(self) -> None:
