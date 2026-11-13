@@ -74,3 +74,56 @@ def test_the_book_numbers_by_hand():
     market = 0.4 * 0.2
     residual = (0.4 * 0.3) ** 2 + (0.2 * 0.1) ** 2
     assert model.book_volatility(weights) == pytest.approx(sqrt(market ** 2 + residual))
+
+
+# Invalid factors must stop a decision, not make NaN comparisons skip limits.
+def test_constant_benchmark_cannot_silently_disable_factor_limits():
+    data = FactorDataClient({"SPY": [0.0] * 80, "AAPL": MARKET}, {})
+    with pytest.raises(ValueError, match="benchmark return variance"):
+        exposures(["AAPL"], "SPY", AS_OF, data, START)
+
+
+def test_constant_paired_benchmark_is_rejected_even_when_full_history_varies():
+    # A's sixty most recent paired returns see a flat benchmark; earlier
+    # benchmark observations still make its full-window variance positive.
+    data = FactorDataClient({"SPY": MARKET[:20] + [0.0] * 60,
+                             "AAPL": MARKET[:60]}, {})
+    with pytest.raises(ValueError, match="paired benchmark return variance"):
+        exposures(["AAPL"], "SPY", AS_OF, data, START)
+
+
+@pytest.mark.parametrize("close", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_bad_factor_close_is_rejected_before_log_returns(close):
+    class BadClose(FactorDataClient):
+        def get_prices(self, ticker, start_date, end_date, **kwargs):
+            bars = super().get_prices(ticker, start_date, end_date, **kwargs)
+            if ticker == "AAPL":
+                bars[10].close = close
+            return bars
+    data = BadClose({"SPY": MARKET, "AAPL": MARKET}, {})
+    with pytest.raises(ValueError, match="factor closes must be finite and positive"):
+        exposures(["AAPL"], "SPY", AS_OF, data, START)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["beta", "residual_volatility"])
+def test_name_factor_values_must_be_finite(field, value):
+    fields = dict(beta=1.0, residual_volatility=0.2, sector="Tech", n_bars=80)
+    fields[field] = value
+    with pytest.raises(ValueError):
+        NameExposure(**fields)
+
+
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf"), float("-inf")])
+def test_benchmark_volatility_must_be_finite_and_nonnegative(value):
+    with pytest.raises(ValueError):
+        Exposures(as_of=AS_OF, benchmark_volatility=value, names={})
+
+
+def test_derived_book_factor_overflow_is_rejected():
+    model = Exposures(as_of=AS_OF, benchmark_volatility=0.2, names={
+        "A": NameExposure(beta=1e308, residual_volatility=0.2, sector="Tech", n_bars=80),
+        "B": NameExposure(beta=1e308, residual_volatility=0.2, sector="Tech", n_bars=80),
+    })
+    with pytest.raises(ValueError, match="book beta must be finite"):
+        model.book_beta({"A": 1.0, "B": 1.0})

@@ -173,3 +173,60 @@ def test_kill_switch_round_trips_and_logs(tmp_path):
     assert [e["kind"] for e in ledger.events()] == ["halt", "resume"]
     assert ledger.events()[0]["reason"] == "drawdown breach"
     assert all("time" in e for e in ledger.events())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("cash", 42.0), ("positions", {"TEST": 7}), ("peak_nav", 1_000_000_000.0),
+    ("pending", {"unexpected": "decision"}), ("allocation", {"unexpected": "allocation"}),
+])
+def test_modified_checkpoint_state_falls_back_to_event_chain(tmp_path, field, value):
+    ledger = Ledger(tmp_path)
+    for record in _chain(MONDAY):
+        ledger.append(record)
+    expected = ledger.replay(100_000, full=True)
+    path = ledger.checkpoint(expected)
+    payload = json.loads(path.read_text())
+    payload["state"][field] = value
+    path.write_text(json.dumps(payload))
+    assert ledger.replay(100_000) == expected
+    assert ledger.replay(100_000, full=True) == expected
+
+
+def test_legacy_checkpoint_is_discarded_without_changing_event_records(tmp_path):
+    ledger = Ledger(tmp_path)
+    for record in _chain(MONDAY):
+        ledger.append(record)
+    expected = ledger.replay(100_000, full=True)
+    records_before = {session: ledger.path(session).read_bytes() for session in MONDAY}
+    path = ledger.checkpoint_path(MONDAY[0][:10])
+    path.write_text(expected.model_copy(update={"peak_nav": 1_000_000_000.0}).model_dump_json())
+    assert ledger.replay(100_000) == expected
+    assert {session: ledger.path(session).read_bytes() for session in MONDAY} == records_before
+
+
+def test_concurrent_append_cannot_commit_two_branches(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from hedge_fund.ownership import FundBusy
+
+    ledger = Ledger(tmp_path)
+    ledger.init()
+    entered, release = threading.Event(), threading.Event()
+    original_latest = ledger.latest
+    def paused_latest():
+        value = original_latest()
+        entered.set()
+        assert release.wait(5)
+        return value
+    ledger.latest = paused_latest
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(ledger.append, _bar(MONDAY[0]))
+        assert entered.wait(5)
+        try:
+            with pytest.raises(FundBusy):
+                pool.submit(Ledger(tmp_path).append, _bar(MONDAY[1])).result(timeout=5)
+        finally:
+            release.set()
+        first.result(timeout=5)
+    assert ledger.sessions() == [MONDAY[0]]
+    assert ledger.replay(100_000, full=True).last_session == MONDAY[0]

@@ -409,3 +409,28 @@ def test_the_halving_tier_and_factor_caps_serialize_only_when_set():
     for bad in ({"max_beta": 0}, {"max_sector_pct": 1.5}, {"max_volatility": -0.1}, {"halve_drawdown_pct": 1.0}):
         with pytest.raises(ValidationError):
             FundSpec(**{**MINIMAL, "risk": {**MINIMAL["risk"], **bad}})
+
+
+@pytest.mark.parametrize("path", [
+    ("capital",), ("interval",), ("allocation", "slope"),
+    ("strategies", 0, "weight"), ("strategies", 0, "models", 0, "weight"),
+    ("strategies", 0, "blend", "gross_target"),
+])
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_nonfinite_mandate_numbers_are_configuration_errors(path, value):
+    data = deepcopy(MINIMAL)
+    data.update(rebalance="minute", allocation={})
+    target = data
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+    with pytest.raises(ValidationError):
+        FundSpec(**data)
+
+
+@pytest.mark.parametrize("name", ["../outside", "/tmp/outside", "nested/name", "nested\\name"])
+def test_saved_fund_cannot_escape_selected_directory(tmp_path, name):
+    spec = FundSpec(**{**MINIMAL, "name": name})
+    with pytest.raises(ValueError, match="local filename"):
+        save_spec(spec, tmp_path / "mandates")
+    assert not (tmp_path / "mandates").exists()

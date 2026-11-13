@@ -132,3 +132,13 @@ class TestPEADPredict:
         fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
         sig = PEADModel().predict("TEST", "2025-08-01", fd)
         assert isinstance(sig, Signal)
+
+
+def test_intraday_pead_excludes_day_only_same_day_filings_but_daily_mode_keeps_them():
+    client = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
+    model = PEADModel()
+    for bar in ("2025-08-01T09:30:00", "2025-08-01T16:00:00"):
+        assert model.predict("TEST", bar, client).value == 0.0
+    assert model.predict("TEST", "2025-08-01", client).value == 1.0
+    assert model.predict("TEST", "2025-08-04T09:30:00", client).value == 1.0
+    assert model.predict("TEST", "2025-08-06T09:30:00", client).value == 0.0

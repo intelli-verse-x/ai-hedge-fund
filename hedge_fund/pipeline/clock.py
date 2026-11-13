@@ -243,6 +243,10 @@ class PinnedQuotes:
         return PriceSnapshot(ticker=ticker, price=marked.prices[ticker], time=when)
 
     def get_prices(self, ticker, start_date, end_date, **kwargs):
+        if is_intraday(self._session) and kwargs.get("interval", "day") == "day":
+            end_date = min(end_date[:10], daily_history_cutoff(self._session))
+            if start_date[:10] > end_date:
+                return []
         return self._data.get_prices(ticker, start_date, end_date, **kwargs)
 
     def get_financial_metrics(self, ticker, end_date, period="ttm", limit=10):
@@ -279,6 +283,11 @@ def _session_stamp(session: str) -> str:
     if is_intraday(session):
         return bar_time(session).isoformat()
     return datetime.fromisoformat(session).replace(hour=16, tzinfo=NEW_YORK).isoformat()
+
+
+def daily_history_cutoff(session: str) -> str:
+    """Day-only observations cannot establish availability within that day."""
+    return previous_day(session_date(session)) if is_intraday(session) else session
 
 
 def execution_policy(session: str) -> str:

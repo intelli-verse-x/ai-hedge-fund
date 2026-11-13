@@ -26,6 +26,8 @@ from hedge_fund.paper import (
     list_deployed,
     load_deployed,
 )
+from hedge_fund.ownership import ownership
+from hedge_fund.paper.deployed import validate_fund_name
 from hedge_fund.tui.backtest import BacktestScreen
 from hedge_fund.tui.palette import BRIGHT, CYAN, GREEN, MUTED, RED, TEXT
 from hedge_fund.tui.shared import cadence_identity, MODE_LABELS, strategy_description
@@ -338,10 +340,11 @@ def wipe_fund(name: str) -> None:
     backtest results, and the paper fund — ledger, book, events — if one was
     deployed. Called only after the user has said yes to `ConfirmWipeScreen`,
     whether to delete the fund or to let a new one take its name."""
-    (paths.MANDATES_DIR / f"{name}.yaml").unlink(missing_ok=True)
-    for receipt in receipts(name):
-        receipt.unlink(missing_ok=True)
-    shutil.rmtree(paths.PAPER_DIR / name, ignore_errors=True)
+    with ownership(paths.PAPER_DIR / validate_fund_name(name)):
+        (paths.MANDATES_DIR / f"{name}.yaml").unlink(missing_ok=True)
+        for receipt in receipts(name):
+            receipt.unlink(missing_ok=True)
+        shutil.rmtree(paths.PAPER_DIR / name, ignore_errors=True)
 
 
 def short_tickers(universe: list[str], limit: int = 2) -> str:

@@ -53,3 +53,10 @@ def test_zero_on_every_field_is_a_free_fill():
 def test_negative_or_unknown_fields_are_rejected(bad):
     with pytest.raises(ValidationError):
         TradingCosts(**bad)
+
+
+@pytest.mark.parametrize("field", ["spread_bps", "commission_per_share", "impact_coefficient", "min_trade_pct"])
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_nonfinite_costs_are_rejected_at_configuration_boundary(field, value):
+    with pytest.raises(ValidationError):
+        TradingCosts(**{field: value})

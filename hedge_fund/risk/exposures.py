@@ -23,10 +23,10 @@ window so every number on the record comes from the same bars.
 
 from __future__ import annotations
 
-from math import log, sqrt
+from math import hypot, isfinite, log, sqrt
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from hedge_fund.data.protocol import DataClient
 
@@ -41,22 +41,29 @@ _BLUME_WEIGHT = 0.67
 class NameExposure(BaseModel):
     """One name in the model: what the benchmark explains and what it does not."""
 
+    model_config = ConfigDict(allow_inf_nan=False)
+
     beta: float                       # Blume-adjusted: 0.67 x fitted + 0.33
-    residual_volatility: float        # annualized sigma of the fit's residuals
+    residual_volatility: float = Field(ge=0)  # annualized sigma of the fit's residuals
     sector: str | None                # the data provider's sector; None when it has none
-    n_bars: int                       # paired daily returns the fit used
+    n_bars: int = Field(ge=0)          # paired daily returns the fit used
 
 
 class Exposures(BaseModel):
     """The model at one date: the benchmark's volatility and every name's
     exposure. The decision carries the one its clamps were measured with."""
 
+    model_config = ConfigDict(allow_inf_nan=False)
+
     as_of: str
-    benchmark_volatility: float       # annualized sigma of the benchmark's daily log returns
+    benchmark_volatility: float = Field(ge=0)  # annualized sigma of the benchmark's daily log returns
     names: dict[str, NameExposure]
 
     def book_beta(self, weights: dict[str, float]) -> float:
-        return sum(weight * self.names[ticker].beta for ticker, weight in weights.items())
+        beta = sum(weight * self.names[ticker].beta for ticker, weight in weights.items())
+        if not isfinite(beta):
+            raise ValueError("book beta must be finite")
+        return beta
 
     def sector_nets(self, weights: dict[str, float]) -> dict[str, float]:
         """Signed weight per sector; a name without a sector counts nowhere."""
@@ -65,14 +72,19 @@ class Exposures(BaseModel):
             sector = self.names[ticker].sector
             if sector is not None:
                 nets[sector] = nets.get(sector, 0.0) + weight
+        if not all(isfinite(net) for net in nets.values()):
+            raise ValueError("sector exposure must be finite")
         return nets
 
     def book_volatility(self, weights: dict[str, float]) -> float:
         """Annualized: market risk through the book's beta, plus each name's
         residual risk, taken as independent of every other name's."""
         market = self.book_beta(weights) * self.benchmark_volatility
-        residual = sum((weight * self.names[ticker].residual_volatility) ** 2 for ticker, weight in weights.items())
-        return sqrt(market ** 2 + residual)
+        volatility = hypot(market, *(weight * self.names[ticker].residual_volatility
+                                    for ticker, weight in weights.items()))
+        if not isfinite(volatility):
+            raise ValueError("book volatility must be finite")
+        return volatility
 
 
 def exposures(
@@ -87,6 +99,9 @@ def exposures(
         raise ValueError(f"{benchmark}: {len(market)} daily returns in [{start}, {as_of}]; "
                          f"a factor limit needs at least {_MIN_FACTOR_BARS}")
     market_series = np.array(list(market.values()))
+    market_variance = float(np.var(market_series, ddof=1))
+    if not isfinite(market_variance) or market_variance <= 0:
+        raise ValueError(f"{benchmark}: benchmark return variance must be finite and positive")
     names: dict[str, NameExposure] = {}
     for ticker in tickers:
         own = _log_returns(ticker, start, as_of, data_client)
@@ -98,7 +113,12 @@ def exposures(
             continue
         x = np.array([market[day] for day in days])
         y = np.array([own[day] for day in days])
-        fitted = float(np.cov(x, y, ddof=1)[0, 1] / np.var(x, ddof=1))
+        paired_variance = float(np.var(x, ddof=1))
+        if not isfinite(paired_variance) or paired_variance <= 0:
+            raise ValueError(f"{ticker}: paired benchmark return variance must be finite and positive")
+        fitted = float(np.cov(x, y, ddof=1)[0, 1] / paired_variance)
+        if not isfinite(fitted):
+            raise ValueError(f"{ticker}: fitted beta must be finite")
         residuals = y - (y.mean() + fitted * (x - x.mean()))
         names[ticker] = NameExposure(
             beta=_BLUME_WEIGHT * fitted + (1 - _BLUME_WEIGHT),
@@ -122,4 +142,7 @@ def _log_returns(ticker: str, start: str, end: str, data_client: DataClient) -> 
         (p for p in data_client.get_prices(ticker, start, end) if start <= p.time[:10] <= end),
         key=lambda p: p.time,
     )
-    return {b.time[:10]: log(b.close / a.close) for a, b in zip(bars, bars[1:])}
+    if any(not isfinite(bar.close) or bar.close <= 0 for bar in bars):
+        raise ValueError(f"{ticker}: factor closes must be finite and positive")
+    # Subtract logs to avoid overflowing a ratio of otherwise valid closes.
+    return {b.time[:10]: log(b.close) - log(a.close) for a, b in zip(bars, bars[1:])}

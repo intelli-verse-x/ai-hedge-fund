@@ -106,3 +106,17 @@ def test_no_cost_model_fills_at_the_reference_price():
     broker = SimBroker(cash=1_000.0)
     fill = broker.place_order(Order(ticker="AAPL", side="buy", quantity=1, price=100.0))
     assert fill.price == 100.0 and broker.cash() == 900.0
+
+
+@pytest.mark.parametrize("side,liquidity,costs", [
+    ("sell", {"adv": 1.0, "volatility": 2.0}, TradingCosts()),
+    ("buy", {"adv": 1.0, "volatility": float("inf")}, TradingCosts()),
+    ("buy", {"adv": float("nan"), "volatility": 0.1}, TradingCosts()),
+    ("sell", {}, TradingCosts().model_copy(update={"commission_per_share": float("inf")})),
+])
+def test_invalid_cost_adjusted_fill_preserves_book(side, liquidity, costs):
+    broker = SimBroker(cash=1_000.0, costs=costs)
+    with pytest.raises(ValueError, match="cost-adjusted"):
+        broker.place_order(Order(ticker="TEST", side=side, quantity=1, price=100.0, **liquidity))
+    assert broker.cash() == 1_000.0
+    assert broker.positions() == {}

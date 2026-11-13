@@ -51,6 +51,10 @@ class SimBroker:
             order.side, order.price, order.participation, order.volatility or 0.0,
         )
         commission = 0.0 if self._costs is None else self._costs.commission(order.quantity)
+        # Validate the actual fill, not only its reference mark. Extreme or
+        # non-finite liquidity/cost inputs must never poison either book.
+        if not isfinite(price) or price <= 0 or not isfinite(commission) or commission < 0:
+            raise ValueError(f"cannot fill {order.ticker}: invalid cost-adjusted price or commission")
 
         if order.side == "buy":
             self._shares[order.ticker] = self._shares.get(order.ticker, 0) + order.quantity

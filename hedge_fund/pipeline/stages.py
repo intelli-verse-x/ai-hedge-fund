@@ -20,7 +20,7 @@ from hedge_fund.brokers.protocol import Broker
 from hedge_fund.data.protocol import DataClient
 from hedge_fund.fund import Fund, FundSpec, normalize_universe
 from hedge_fund.models import Signal
-from hedge_fund.pipeline.clock import Clock, clock_for, execution_policy, PinnedQuotes
+from hedge_fund.pipeline.clock import Clock, clock_for, daily_history_cutoff, execution_policy, PinnedQuotes
 from hedge_fund.pipeline.execution import build_orders
 from hedge_fund.pipeline.models import (
     AllocationRecord,
@@ -62,7 +62,7 @@ def assess_fund(
         raise ValueError(f"assessment {as_of} requires incomplete data")
     spec = fund.spec.model_copy(deep=True)
     universe = normalize_universe(universe)
-    session_date = clock.session_date(as_of)
+    session_date = daily_history_cutoff(as_of)
     start = history_start(session_date, history_days(spec))
     marks, skipped = _mark_prices(universe, session_date, data_client, start)
 
@@ -165,7 +165,7 @@ def execute_decision(
     equity_before = cash_before + sum(p.shares * marks[t] for t, p in held.items())
     if not isfinite(equity_before) or equity_before <= 0:
         raise ValueError(f"{spec.name}: equity on {session} must be finite and positive")
-    liquid = liquidity(sorted(set(held) | set(targets)), clock.session_date(session), data_client,
+    liquid = liquidity(sorted(set(held) | set(targets)), daily_history_cutoff(session), data_client,
                        history_days(spec))
     max_shares: dict[str, int] | None = None
     if spec.risk.max_adv_pct is not None:

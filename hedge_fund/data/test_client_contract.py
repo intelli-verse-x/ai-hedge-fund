@@ -448,3 +448,37 @@ def test_one_meter_sums_across_clients_and_each_client_has_its_own_by_default():
         c.get_company_facts("NOPE")
         assert c.meter.calls == 1
     assert shared.calls == 2
+
+
+@pytest.mark.parametrize("url", [
+    "https://attacker.invalid/page", "http://api.financialdatasets.ai/page",
+    "//attacker.invalid/page", "https://api.financialdatasets.ai.attacker.invalid/page",
+    "https://api.financialdatasets.ai@attacker.invalid/page",
+    "https://user@api.financialdatasets.ai/page", "https://api.financialdatasets.ai:444/page",
+    "https://api.financialdatasets.ai:invalid/page", "https://api.financialdatasets.ai/page#fragment",
+    "https://api.financialdatasets.ai\\@attacker.invalid/page", "https://api.financialdatasets.ai/\npage",
+])
+def test_untrusted_pagination_url_never_reaches_credentialed_session(client, url):
+    calls = _stub(client, [_FakeResponse(payload={"prices": [], "next_page_url": url})])
+    with pytest.raises(FDClientError):
+        client.get_prices("AAPL", "2024-01-01", "2024-12-31")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirects_cannot_forward_api_credentials_or_wallet_session(client, status):
+    calls = _stub(client, [_FakeResponse(status, headers={"Location": "https://attacker.invalid/"})])
+    with pytest.raises(FDClientError, match="redirects"):
+        client.get_prices("AAPL", "2024-01-01", "2024-12-31")
+    assert len(calls) == 1 and calls[0]["allow_redirects"] is False
+
+
+def test_same_origin_pagination_is_allowed_but_repeated_page_stops(client):
+    page = "https://api.financialdatasets.ai/prices/?page=2"
+    calls = _stub(client, [
+        _FakeResponse(payload={"prices": [], "next_page_url": page}),
+        _FakeResponse(payload={"prices": [], "next_page_url": page}),
+    ])
+    with pytest.raises(FDClientError, match="repeated"):
+        client.get_prices("AAPL", "2024-01-01", "2024-12-31")
+    assert len(calls) == 2 and calls[1]["url"] == page

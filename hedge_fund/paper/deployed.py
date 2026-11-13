@@ -21,6 +21,7 @@ from hedge_fund.brokers.paper import PaperBroker
 from hedge_fund.fund import FundSpec, normalize_universe
 from hedge_fund.paper.ledger import Ledger
 from hedge_fund.paths import PAPER_DIR
+from hedge_fund.ownership import ownership
 
 FUND_FILE = "fund.yaml"
 BROKER_FILE = "broker.json"
@@ -56,21 +57,22 @@ def deploy(
 ) -> Path:
     """Create paper/<name>/ with an empty ledger and a book seeded with the
     mandate's capital. Returns the fund's directory. Refuses to overwrite."""
-    validate_fund_name(name)
-    universe = normalize_universe(universe)
-    directory = Path(root) / name
-    if directory.exists():
-        raise FileExistsError(f"paper fund {name!r} already exists at {directory}")
-    deployed = DeployedFund(
-        name=name, spec=spec, universe=universe, created=_date.today().isoformat(),
-    )
-    directory.mkdir(parents=True)
-    (directory / FUND_FILE).write_text(
-        yaml.safe_dump(deployed.model_dump(), sort_keys=False)
-    )
-    PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
-    Ledger(directory).init()
-    return directory
+    with ownership(Path(root) / validate_fund_name(name)):
+        validate_fund_name(name)
+        universe = normalize_universe(universe)
+        directory = Path(root) / name
+        if directory.exists():
+            raise FileExistsError(f"paper fund {name!r} already exists at {directory}")
+        deployed = DeployedFund(
+            name=name, spec=spec, universe=universe, created=_date.today().isoformat(),
+        )
+        directory.mkdir(parents=True)
+        (directory / FUND_FILE).write_text(
+            yaml.safe_dump(deployed.model_dump(), sort_keys=False)
+        )
+        PaperBroker.create(directory / BROKER_FILE, spec.capital, spec.costs)
+        Ledger(directory).init()
+        return directory
 
 
 def load_deployed(directory: str | Path) -> DeployedFund:

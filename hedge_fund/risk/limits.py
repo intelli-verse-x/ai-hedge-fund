@@ -37,7 +37,7 @@ _HALF = 0.5
 class RiskLimits(BaseModel):
     """The fund's hard limits, set in its FundSpec."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     max_position_pct: float = Field(
         gt=0, le=1.0, description="max |weight| per ticker, as a fraction of equity"
@@ -147,6 +147,7 @@ def apply_limits(
        drawdown halving, then the gross cap. Each shrinks every weight by
        one factor, so none can re-violate a stage before it.
     """
+    limits = RiskLimits.model_validate(limits.model_dump())
     if not isfinite(limits.max_position_pct) or not isfinite(limits.max_gross_exposure):
         raise ValueError("risk limits must be finite")
     if not 0 < limits.max_position_pct <= 1 or limits.max_gross_exposure <= 0:
@@ -161,6 +162,9 @@ def apply_limits(
     if limits.has_factor_limits and exposures is None:
         raise ValueError("a beta, sector, or volatility limit needs the book's exposures")
     if exposures is not None:
+        # Model instances are mutable; revalidate their nested numeric values
+        # at the final risk boundary as well as when they were first parsed.
+        exposures = Exposures.model_validate(exposures.model_dump())
         missing = sorted(set(weights) - set(exposures.names))
         if missing:
             raise ValueError(f"no exposure for {', '.join(missing)}")

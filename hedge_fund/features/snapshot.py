@@ -16,10 +16,12 @@ must produce an identical prompt (a cache hit), not two paid LLM calls.
 from __future__ import annotations
 
 import hashlib
+from datetime import date, timedelta
 
 from pydantic import BaseModel
 
 from hedge_fund.data.protocol import DataClient
+from hedge_fund.data.bars import is_intraday
 from hedge_fund.features.breakpoints import MEBreakpoints
 
 # An agent can't say anything defensible about a company with less history
@@ -193,11 +195,14 @@ def build_snapshot(
     silently become a neutral view.
 
     *as_of* may be a bar (YYYY-MM-DDTHH:MM:SS) for a minute fund; filings
-    are dated by day, so the data layer is asked by the date alone. Every
-    bar of a day then shares one metrics response and one prompt.
+    are dated by day, so a bar conservatively uses filings through the
+    previous calendar day. Same-day day-only filings may have arrived after
+    the bar. Precisely timestamped releases belong in the intraday context.
     """
+    cutoff = ((date.fromisoformat(as_of[:10]) - timedelta(days=1)).isoformat()
+              if is_intraday(as_of) else as_of[:10])
     metrics = data_client.get_financial_metrics(
-        ticker, as_of[:10], period="ttm", limit=periods,
+        ticker, cutoff, period="ttm", limit=periods,
     )
     if len(metrics) < MIN_PERIODS:
         raise InsufficientData(

@@ -217,3 +217,31 @@ def test_old_executed_record_defaults_remain_readable():
     historical = CycleRecord.model_validate(raw)
     assert historical.execution_as_of is None
     assert historical.original_assessment is None
+
+
+def test_intraday_assessment_and_execution_use_only_completed_daily_history(monkeypatch):
+    from importlib import import_module
+    from types import SimpleNamespace
+    pipeline = import_module("hedge_fund.pipeline.stages")
+    fund, _ = make_fund()
+    fund.spec = fund.spec.model_copy(update={"rebalance": "minute"})
+    calls = []
+    original_marks, original_liquidity = pipeline._mark_prices, pipeline.liquidity
+    def marks(tickers, day, *args):
+        calls.append(("assessment", day))
+        return original_marks(tickers, day, *args)
+    def liquidity(tickers, day, *args):
+        calls.append(("execution", day))
+        return original_liquidity(tickers, day, *args)
+    monkeypatch.setattr(pipeline, "_mark_prices", marks)
+    monkeypatch.setattr(pipeline, "liquidity", liquidity)
+    clock = SimpleNamespace(
+        is_complete=lambda session: True,
+        previous=lambda session: MONDAY + "T09:25:00",
+        marks=lambda tickers, session: SimpleNamespace(prices={ticker: 100.0 for ticker in tickers}, times=None),
+    )
+    data = market(price=9999)  # the day's final close must not enter the morning lookbacks
+    proposal = assess_fund(fund, MONDAY + "T09:25:00", data, ["A"], clock)
+    assert proposal.marks == {"A": 100}
+    execute_decision(fund, proposal, MONDAY + "T09:30:00", SimBroker(10_000), data, clock)
+    assert calls == [("assessment", "2024-06-09"), ("execution", "2024-06-09")]

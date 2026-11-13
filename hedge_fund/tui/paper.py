@@ -17,6 +17,7 @@ from textual.widgets import ContentSwitcher, Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
 from hedge_fund import paths
+from hedge_fund.ownership import FundBusy
 from hedge_fund.data import CachedDataClient, FDClient, PriceSnapshot
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.fund import FundSpec
@@ -289,8 +290,15 @@ class PaperScreen(Screen):
             return
         name = snap.deployed.name
         if is_running(snap.directory):
-            stop_runner(snap.directory)
-            self.notify(f"{name} stopping after the session in flight")
+            try:
+                stopped = stop_runner(snap.directory)
+            except (FundBusy, OSError) as exc:
+                self.notify(f"Could not stop {name}: {exc}", severity="error")
+                return
+            if not stopped:
+                self.notify(f"Could not verify {name}'s runner ownership; no stop requested.", severity="warning")
+                return
+            self.notify(f"{name} stop requested · waiting for the session in flight")
             self._populate(name)
             return
         if snap.halted:
@@ -301,10 +309,10 @@ class PaperScreen(Screen):
             if demand_run_keys(self.app, resume):
                 try:
                     spawn_runner(snap.directory)
-                except OSError as exc:
+                except (FundBusy, OSError) as exc:
                     self.notify(f"Could not start {name}: {exc}", severity="error")
                     return
-                self.notify(f"{name} running · {cadence_identity(snap.spec)}")
+                self.notify(f"{name} start requested · {cadence_identity(snap.spec)}")
                 self._populate(name)
         resume()
 
@@ -329,7 +337,11 @@ class PaperScreen(Screen):
         snap = self._current()
         if snap is None:
             return
-        snap.ledger.resume()
+        try:
+            snap.ledger.resume()
+        except FundBusy as exc:
+            self.notify(f"Could not resume {snap.deployed.name}: {exc}", severity="warning")
+            return
         self.notify(f"{snap.deployed.name} resumed")
         self._populate(snap.deployed.name)
 
@@ -343,7 +355,11 @@ class PaperScreen(Screen):
     def _finish_delete(self, name: str, yes: bool | None) -> None:
         if not yes:
             return
-        wipe_fund(name)
+        try:
+            wipe_fund(name)
+        except FundBusy as exc:
+            self.notify(f"Could not delete {name}: {exc}", severity="warning")
+            return
         self.notify(f"Deleted {name}", severity="warning")
         self._populate(None)
 

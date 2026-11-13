@@ -27,6 +27,7 @@ from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from hedge_fund import paths
+from hedge_fund.ownership import FundBusy, ownership
 from hedge_fund.data.bars import bars_per_day
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import (
@@ -466,6 +467,16 @@ class BuilderScreen(Screen):
     # ---- finish -----------------------------------------------------------
 
     def _finish_build(self) -> None:
+        # Keep replacement, definition and deployment under the same writer
+        # ownership; a running fund is refused before any of them changes.
+        name = validate_fund_name(self._state["name"])
+        try:
+            with ownership(paths.PAPER_DIR / name):
+                self._finish_owned_build()
+        except FundBusy as exc:
+            self.notify(f"Could not build {name}: {exc}", severity="warning")
+
+    def _finish_owned_build(self) -> None:
         # Equal capital slices; master risk defaults. Power users edit the YAML.
         intraday = self._state["rebalance"] == "minute"
         spec = FundSpec(
@@ -498,15 +509,11 @@ class BuilderScreen(Screen):
                         severity="error")
             self._goto("step-name")
             return
-        self._built = (spec, path)
-
         staff = ", ".join(s.title for s in self._state["strategies"])
         identity = Text.assemble(
             (spec.name, f"bold {BRIGHT}"),
             (f"  ·  {staff}  ·  ${spec.capital:,.0f}  ·  {cadence_identity(spec)}", MUTED),
         )
-        if replaced:
-            self.notify(f"Replaced the previous {spec.name}.", severity="warning")
         if self.mode == "paper":
             universe = self._state["universe"]
             directory = deploy(spec.name, spec, universe, root=paths.PAPER_DIR)
@@ -546,6 +553,9 @@ class BuilderScreen(Screen):
                 Text("Pick the tickers and the window when you backtest it.", style=MUTED),
                 *(Text(f"{s.title}: {strategy_description(s)}", style=MUTED) for s in spec.strategies),
             ))
+        self._built = (spec, path)
+        if replaced:
+            self.notify(f"Replaced the previous {spec.name}.", severity="warning")
         self._goto("step-done")
 
     @on(OptionList.OptionSelected, "#done-menu")

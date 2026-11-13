@@ -354,3 +354,23 @@ def test_builder_paper_mode_run_its_first_session_opens_the_approval_step(monkey
             assert rail.get_option_at_index(rail.highlighted).id == "paper:0"
             assert not isinstance(app.screen_stack[-2], builder.BuilderScreen)  # the builder was switched out
     asyncio.run(scenario())
+
+
+def test_builder_busy_replacement_refuses_before_persisting_or_showing_success():
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from hedge_fund.ownership import ownership
+
+    notices, persisted = [], []
+    screen = SimpleNamespace(_state={"name": "busy"},
+                             _finish_owned_build=lambda: persisted.append("write"),
+                             notify=lambda *args, **kwargs: notices.append((args, kwargs)))
+    with ownership(paths.PAPER_DIR / "busy"):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(builder.BuilderScreen._finish_build, screen).result(timeout=5)
+    assert persisted == [] and len(notices) == 1
+    assert "Could not build busy" in notices[0][0][0]
+    assert notices[0][1]["severity"] == "warning"
+
+    builder.BuilderScreen._finish_build(screen)
+    assert persisted == ["write"]

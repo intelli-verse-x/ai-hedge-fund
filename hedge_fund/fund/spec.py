@@ -51,7 +51,7 @@ class TradingWindow(BaseModel):
     """When a minute fund trades, in New York time. Both ends are sessions:
     the window opens with a bar at `start` and always closes with one at `end`."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     start: str = "09:30"
     end: str = "16:00"
@@ -86,7 +86,7 @@ class TradingWindow(BaseModel):
 class ModelSpec(BaseModel):
     """One signal model in a strategy — an LLM agent or a quant model."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     name: str = Field(description="key into ALPHA_MODEL_REGISTRY, e.g. 'buffett'")
     weight: float = Field(default=1.0, gt=0, description="blend weight")
@@ -103,7 +103,7 @@ class ModelSpec(BaseModel):
 class BlendPolicy(BaseModel):
     """How a strategy's model views combine into one sleeve."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     method: Literal["conviction_weighted"] = "conviction_weighted"
     gross_target: float = Field(default=1.0, gt=0, description="desired sum of |weights| when views exist")
@@ -119,7 +119,7 @@ class StrategySpec(BaseModel):
     fund-assembly decision, not a property of the strategy itself.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     name: str
     display_name: str | None = Field(default=None, description="human-facing name, e.g. 'Deep Value'")
@@ -152,7 +152,7 @@ class AllocationPolicy(BaseModel):
     while the record is short.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     min_evidence: int = Field(
         default=20, ge=2, description="graded dates (analyst) or periods (strategy) before a weight moves"
@@ -175,7 +175,7 @@ class FundSpec(BaseModel):
     the ticker universe is supplied separately for each run.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     schema_version: Literal[2]
     name: str

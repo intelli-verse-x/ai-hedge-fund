@@ -216,3 +216,28 @@ def test_a_factor_cap_needs_exposures_for_every_name():
         apply_limits({"A": 0.1, "B": 0.1}, RiskLimits(**WIDE, max_beta=0.5), exposures=_model(A=(1, 0, None)))
     with pytest.raises(ValueError, match="drawdown"):
         apply_limits({"A": 0.1}, RiskLimits(**WIDE), drawdown=-0.1)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["max_beta", "max_volatility", "max_sector_pct", "max_net_exposure"])
+def test_optional_risk_limits_cannot_be_nonfinite(field, value):
+    with pytest.raises(ValueError):
+        RiskLimits(max_position_pct=1.0, max_gross_exposure=1.0, **{field: value})
+
+
+def test_mutated_exposure_is_revalidated_at_risk_boundary():
+    from hedge_fund.risk.exposures import Exposures, NameExposure
+    model = Exposures(as_of="2024-06-03", benchmark_volatility=0.2, names={
+        "A": NameExposure(beta=1.0, residual_volatility=0.2, sector="Tech", n_bars=80),
+    })
+    model.names["A"].beta = float("nan")
+    limits = RiskLimits(max_position_pct=1.0, max_gross_exposure=1.0, max_beta=0.1)
+    with pytest.raises(ValueError):
+        apply_limits({"A": 1.0}, limits, exposures=model)
+
+
+def test_mutated_optional_limit_is_revalidated_at_risk_boundary():
+    limits = RiskLimits(max_position_pct=1.0, max_gross_exposure=1.0, max_beta=0.1)
+    limits.max_beta = float("inf")
+    with pytest.raises(ValueError):
+        apply_limits({"A": 1.0}, limits)

@@ -207,3 +207,21 @@ def test_a_stale_pending_is_refreshed_at_the_bar_before_execution():
     assert record.executed.original_assessment.as_of == f"{yesterday}T16:00:00"
     assert len(analyst.predict_calls) > asked_before  # refreshed, then decided again at 10:05
     assert record.executed.fills[0].price == 91.0
+
+
+def test_intraday_pinned_daily_history_excludes_uncompleted_day():
+    from hedge_fund.pipeline.clock import daily_history_cutoff, PinnedQuotes
+    calls = []
+    class DayData:
+        def get_prices(self, ticker, start, end, **kwargs):
+            calls.append((ticker, start, end, kwargs))
+            return []
+    view = PinnedQuotes(DayData(), object(), "2026-10-05T09:30:00")
+    assert daily_history_cutoff("2026-10-05T09:30:00") == "2026-10-04"
+    assert daily_history_cutoff("2026-10-05") == "2026-10-05"
+    view.get_prices("A", "2026-10-01", "2026-10-05")
+    assert calls[-1][2] == "2026-10-04"
+    assert view.get_prices("A", "2026-10-05", "2026-10-05") == []
+    assert len(calls) == 1  # not even a provider request for an empty range
+    view.get_prices("A", "2026-10-05", "2026-10-05", interval="minute")
+    assert calls[-1][2] == "2026-10-05"  # precise intraday context keeps its own timestamp filter

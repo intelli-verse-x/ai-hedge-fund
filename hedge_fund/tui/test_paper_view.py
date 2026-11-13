@@ -138,3 +138,23 @@ def test_minute_fund_rows_are_pure(monkeypatch):
     assert "SESSIONS" in detail and "2025-01-21T13:05:00" in detail
     assert "+1.0%  ● running" in render(paper_view.paper_slot(0, snap))
     assert snap.metrics().n_cycles == 1  # bar keys do not trip the metrics' date math
+
+
+def test_live_rows_mixed_age_quotes_use_the_oldest_held_print():
+    from types import SimpleNamespace
+
+    snap = SimpleNamespace(state=SimpleNamespace(cash=0, positions={"OLD": 1, "NEW": 1}), nav=200)
+    quotes = {
+        "OLD": make_quote("OLD", 120, "2025-01-20T21:00:00Z"),
+        "NEW": make_quote("NEW", 120, "2025-01-21T15:05:00Z"),
+        "UNHELD": make_quote("UNHELD", 1, "2025-01-01T21:00:00Z"),
+    }
+    _, line = paper_view.live_rows(snap, quotes, today="2025-01-21")[0]
+    assert "$240" in line.plain and "+20.00%" in line.plain
+    assert "as of Jan 20 16:00 ET" in line.plain
+    assert all(span.style == MUTED for span in line.spans)
+
+    quotes["OLD"] = make_quote("OLD", 120, "2025-01-21T14:30:00Z")
+    _, line = paper_view.live_rows(snap, quotes, today="2025-01-21")[0]
+    assert "as of 09:30 ET" in line.plain
+    assert any(span.style != MUTED for span in line.spans)

@@ -376,3 +376,64 @@ def test_sessions_screen_groups_a_minute_funds_bars_by_day():
             assert sessions.highlighted == 1  # the newest bar, not its heading
             assert "next bar's close" in render(report.session_overview(chain[0]))
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["action_resume", "_finish_delete"])
+def test_writer_ownership_refusal_is_not_reported_as_success(monkeypatch, method):
+    from types import SimpleNamespace
+    from hedge_fund.ownership import FundBusy
+
+    def busy(*args):
+        raise FundBusy("writer already owns this fund")
+
+    monkeypatch.setattr(paper, "wipe_fund", busy)
+    notices, refreshes = [], []
+    screen = SimpleNamespace(
+        _current=lambda: SimpleNamespace(ledger=SimpleNamespace(resume=busy),
+                                         deployed=SimpleNamespace(name="test")),
+        notify=lambda *args, **kwargs: notices.append((args, kwargs)),
+        _populate=refreshes.append,
+    )
+    getattr(paper.PaperScreen, method)(screen, *(["test", True] if method == "_finish_delete" else []))
+    assert len(notices) == 1 and "Could not" in notices[0][0][0]
+    assert notices[0][1]["severity"] == "warning" and refreshes == []
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_runner_ownership_refusal_remains_in_the_ui(monkeypatch, running):
+    from types import SimpleNamespace
+    from hedge_fund.ownership import FundBusy
+
+    def busy(*args):
+        raise FundBusy("writer already owns this fund")
+
+    monkeypatch.setattr(paper, "is_running", lambda directory: running)
+    monkeypatch.setattr(paper, "stop_runner", busy)
+    monkeypatch.setattr(paper, "spawn_runner", busy)
+    monkeypatch.setattr(paper, "demand_run_keys", lambda *args: True)
+    notices, refreshes = [], []
+    screen = SimpleNamespace(
+        _current=lambda: SimpleNamespace(error=None, halted=None, directory=paths.PAPER_DIR / "test",
+                                         deployed=SimpleNamespace(name="test")),
+        app=SimpleNamespace(), notify=lambda *args, **kwargs: notices.append((args, kwargs)),
+        _populate=refreshes.append,
+    )
+    paper.PaperScreen.action_runner(screen)
+    assert len(notices) == 1 and "Could not" in notices[0][0][0]
+    assert notices[0][1]["severity"] == "error" and refreshes == []
+
+
+def test_unverified_runner_stop_does_not_claim_success(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(paper, "is_running", lambda directory: True)
+    monkeypatch.setattr(paper, "stop_runner", lambda directory: False)
+    notices, refreshes = [], []
+    screen = SimpleNamespace(
+        _current=lambda: SimpleNamespace(error=None, halted=None, directory=paths.PAPER_DIR / "test",
+                                         deployed=SimpleNamespace(name="test")),
+        notify=lambda *args, **kwargs: notices.append((args, kwargs)), _populate=refreshes.append,
+    )
+    paper.PaperScreen.action_runner(screen)
+    assert len(notices) == 1 and "no stop requested" in notices[0][0][0]
+    assert notices[0][1]["severity"] == "warning" and refreshes == []

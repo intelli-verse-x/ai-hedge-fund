@@ -361,14 +361,39 @@ class FDClient:
         body = resp.json()
         rows = body.get(response_key)
         next_page_url = body.get("next_page_url")
+        visited = {self._api_url(path)}
         while next_page_url and isinstance(rows, list):
-            resp = self._request("GET", next_page_url)
+            page_url = self._api_url(next_page_url)
+            if page_url in visited:
+                raise FDClientError("pagination repeated a page URL")
+            visited.add(page_url)
+            resp = self._request("GET", page_url)
             if resp is None:
                 break
             body = resp.json()
             rows.extend(body.get(response_key) or [])
             next_page_url = body.get("next_page_url")
         return rows
+
+    def _api_url(self, path: str) -> str:
+        """Keep the credentialed/payment session on the configured HTTPS origin."""
+        if not isinstance(path, str) or not path or any(ord(c) < 33 for c in path) or "\\" in path:
+            raise FDClientError("invalid API URL")
+        url = self.BASE_URL + path if path.startswith("/") and not path.startswith("//") else path
+        try:
+            parsed, base = urlsplit(url), urlsplit(self.BASE_URL)
+            permitted = (
+                parsed.scheme == base.scheme == "https"
+                and parsed.hostname == base.hostname
+                and (parsed.port or 443) == (base.port or 443)
+                and parsed.username is None and parsed.password is None
+                and not parsed.fragment
+            )
+        except ValueError:
+            permitted = False
+        if not permitted:
+            raise FDClientError("API URL must use the configured HTTPS origin")
+        return url
 
     def _request(
         self,
@@ -388,9 +413,10 @@ class FDClient:
         Retry-After when it is briefly down, and nothing is charged for it.
 
         *path* may be an absolute URL (a ``next_page_url`` from a previous
-        response), which is requested verbatim.
+        response), which must stay on the configured HTTPS origin.
         """
-        url = path if path.startswith("http") else self.BASE_URL + path
+        url = self._api_url(path)
+        kwargs["allow_redirects"] = False
         for attempt, delay in enumerate((*self._RETRY_DELAYS, None)):
             self.meter.record(url)
             try:
@@ -409,6 +435,9 @@ class FDClient:
                 )
                 time.sleep(delay)
                 continue
+
+            if 300 <= resp.status_code < 400:
+                raise FDClientError("API redirects are not allowed", status_code=resp.status_code)
 
             if resp.status_code == 404:
                 return None

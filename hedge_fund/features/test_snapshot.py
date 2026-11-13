@@ -62,13 +62,11 @@ def test_as_of_passes_through_to_data_client():
     assert call["ticker"] == "TEST"
 
 
-def test_a_bar_asks_for_filings_by_its_date_and_keeps_the_bar_as_its_as_of():
-    """Filings are dated by day: every bar of 2025-01-15 shares one metrics
-    response (and so one prompt-cache key), while the snapshot remembers the
-    bar it was built for."""
+def test_a_bar_uses_prior_day_filings_and_keeps_the_bar_as_its_as_of():
+    """Date-only filings cannot enter the morning of their filing date."""
     client = MockDataClient(metrics=_history())
     snapshot = build_snapshot("TEST", "2025-01-15T10:05:00", client)
-    assert client.metrics_calls[0]["end_date"] == "2025-01-15"
+    assert client.metrics_calls[0]["end_date"] == "2025-01-14"
     assert snapshot.as_of == "2025-01-15T10:05:00"
     assert snapshot.content_hash == build_snapshot("TEST", "2025-01-15T10:10:00", client).content_hash
 
@@ -257,3 +255,12 @@ def test_blind_render_is_opt_in():
     snap = build_snapshot("TEST", "2025-01-15", MockDataClient(metrics=_history()))
     assert snap.render() == snap.render(blind=False)
     assert "Company: TEST" in snap.render()
+
+
+@pytest.mark.parametrize("bar,cutoff", [("2025-01-01T09:30:00", "2024-12-31"),
+                                         ("2025-01-06T16:00:00", "2025-01-05")])
+def test_intraday_fundamentals_cutoff_crosses_calendar_boundaries(bar, cutoff):
+    client = MockDataClient(metrics=_history())
+    snapshot = build_snapshot("TEST", bar, client)
+    assert client.metrics_calls[0]["end_date"] == cutoff
+    assert snapshot.as_of == bar

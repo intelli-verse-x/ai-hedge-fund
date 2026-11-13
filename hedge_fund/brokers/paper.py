@@ -22,6 +22,7 @@ from hedge_fund.brokers.costs import TradingCosts
 from hedge_fund.brokers.models import Fill, Order
 from hedge_fund.brokers.sim import SimBroker
 from hedge_fund.paths import write_atomic
+from hedge_fund.ownership import ownership
 
 
 class PaperBroker(SimBroker):
@@ -42,12 +43,13 @@ class PaperBroker(SimBroker):
     @classmethod
     def create(cls, path: str | Path, cash: float, costs: TradingCosts | None = None) -> PaperBroker:
         """Open a new, empty book at *path*. Refuses to overwrite one."""
-        path = Path(path)
-        if path.exists():
-            raise FileExistsError(f"{path}: a paper broker book already exists")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(path, json.dumps({"cash": cash, "shares": {}}, indent=2))
-        return cls(path, costs)
+        with ownership(Path(path).parent):
+            path = Path(path)
+            if path.exists():
+                raise FileExistsError(f"{path}: a paper broker book already exists")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(path, json.dumps({"cash": cash, "shares": {}}, indent=2))
+            return cls(path, costs)
 
     @classmethod
     def restore(
@@ -56,19 +58,25 @@ class PaperBroker(SimBroker):
         """Rewrite the book wholesale to a known state. Only a redo does this,
         to put the book back where the ledger says it was before the session
         being run again; the fills of that session are discarded with it."""
-        write_atomic(Path(path), json.dumps({
-            "cash": cash, "shares": {t: s for t, s in sorted(shares.items()) if s != 0},
-        }, indent=2))
-        return cls(path, costs)
+        with ownership(Path(path).parent):
+            write_atomic(Path(path), json.dumps({
+                "cash": cash, "shares": {t: s for t, s in sorted(shares.items()) if s != 0},
+            }, indent=2))
+            return cls(path, costs)
 
     @property
     def path(self) -> Path:
         return self._path
 
     def place_order(self, order: Order) -> Fill:
-        fill = super().place_order(order)
-        self._save()
-        return fill
+        with ownership(self._path.parent):
+            data = json.loads(self._path.read_text())
+            shares = {ticker: int(value) for ticker, value in data.get("shares", {}).items() if int(value) != 0}
+            if float(data["cash"]) != self._cash or shares != self._shares:
+                raise ValueError("paper broker book changed; reload before placing an order")
+            fill = super().place_order(order)
+            self._save()
+            return fill
 
     def _save(self) -> None:
         write_atomic(self._path, json.dumps({

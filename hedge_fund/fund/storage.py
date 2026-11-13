@@ -41,6 +41,8 @@ def save_spec(spec: FundSpec, directory: str | Path) -> Path:
     name, so two writers racing for it cannot silently lose one.
     """
     directory = Path(directory)
+    if not spec.name or "/" in spec.name or "\\" in spec.name:
+        raise ValueError("fund name must be a local filename without path separators")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{spec.name}.yaml"
     with path.open("x") as output:

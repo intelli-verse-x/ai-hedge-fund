@@ -59,3 +59,15 @@ def test_costs_are_charged_whichever_way_the_book_is_opened(tmp_path):
     restored = PaperBroker.restore(path, cash=1_000, shares={}, costs=costs)
     restored.place_order(Order(ticker="A", side="buy", quantity=1, price=100))
     assert restored.cash() == pytest.approx(1_000 - 100.05 - 0.005)
+
+
+def test_stale_broker_instance_cannot_overwrite_another_fill(tmp_path):
+    path = tmp_path / "broker.json"
+    first = PaperBroker.create(path, cash=1_000)
+    stale = PaperBroker(path)
+    first.place_order(Order(ticker="A", side="buy", quantity=1, price=100))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="changed"):
+        stale.place_order(Order(ticker="B", side="buy", quantity=1, price=100))
+    assert path.read_bytes() == before
+    assert stale.cash() == 1_000 and stale.positions() == {}

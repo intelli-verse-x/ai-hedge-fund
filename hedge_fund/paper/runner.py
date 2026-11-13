@@ -54,6 +54,7 @@ from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
+from hedge_fund.ownership import mark_runner, owned_fund, read_owner, request_stop, stop_requested
 from hedge_fund.paper.tick import _run, next_session, print_day
 from hedge_fund.pipeline.clock import LiveClock
 from hedge_fund.pipeline.session import FundHalted, SessionRecord
@@ -64,6 +65,7 @@ _DAY_TURNS = time(0, 5)  # when a daily fund's loop first looks for yesterday's 
 _DAY_POLL = 3600         # ...and how often it looks again until the close has landed
 
 
+@owned_fund
 def run(
     directory: str | Path,
     data_client: DataClient,
@@ -189,6 +191,7 @@ def _wait_for(moment: datetime, now: Callable[[], datetime], sleep: Callable[[fl
 # The process around the loop
 # ---------------------------------------------------------------------------
 
+@owned_fund
 def serve(
     directory: str | Path,
     data_client: DataClient,
@@ -205,9 +208,23 @@ def serve(
     stop = threading.Event()
     previous = {s: signal.signal(s, lambda *_: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)}
     (directory / PID_FILE).write_text(str(os.getpid()))
+    watcher = None
     try:
+        mark_runner(directory)
+        owner = read_owner(directory)
+        if owner is None:
+            raise RuntimeError("Runner ownership could not be verified")
+        def watch_stop():
+            while not stop.wait(0.2):
+                if stop_requested(directory, owner["token"]):
+                    stop.set()
+        watcher = threading.Thread(target=watch_stop, daemon=True)
+        watcher.start()
         run(directory, data_client, stop=stop, build_fund=build_fund, on_record=on_record, on_event=on_event)
     finally:
+        stop.set()
+        if watcher is not None:
+            watcher.join(timeout=1)
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         if _read_pid(directory) == os.getpid():
@@ -233,8 +250,7 @@ def stop_runner(directory: str | Path) -> bool:
     pid = _read_pid(directory)
     if pid is None or not is_running(directory):
         return False
-    os.kill(pid, signal.SIGTERM)
-    return True
+    return request_stop(directory, pid)
 
 
 _RUNNER_LOG = "runner.log"  # where a runner started from the app writes its console
@@ -257,6 +273,7 @@ def spawn_runner(directory: Path) -> int:
 def _read_pid(directory: str | Path) -> int | None:
     path = Path(directory) / PID_FILE
     try:
-        return int(path.read_text().strip())
+        pid = int(path.read_text().strip())
+        return pid if pid > 0 else None
     except (OSError, ValueError):
         return None

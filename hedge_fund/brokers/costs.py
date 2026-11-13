@@ -36,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class TradingCosts(BaseModel):
     """The cost model a mandate names in its `costs:` block."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     spread_bps: float = Field(
         default=5.0, ge=0, description="half the bid-ask spread, in basis points, paid on every side"

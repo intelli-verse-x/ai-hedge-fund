@@ -226,9 +226,9 @@ def live_rows(
     snap: PaperSnapshot, quotes: dict[str, PriceSnapshot], today: str | None = None,
 ) -> list[tuple[str, Text | str]]:
     """The book at the latest prints: value, change since the last close,
-    and when the newest print was. Empty unless every held name has a quote;
-    muted all through when the newest print is from before *today*, because
-    a stale quote marked green would be a lie."""
+    and when the oldest held print was. Empty unless every held name has a
+    quote; muted all through when any held print is from before *today*.
+    An older constituent must not be presented as a fully live valuation."""
     if snap.state is None or not snap.state.positions:
         return []
     positions = snap.state.positions
@@ -236,11 +236,11 @@ def live_rows(
         return []
     value = snap.state.cash + sum(shares * quotes[t].price for t, shares in positions.items())
     change = value / snap.nav - 1 if snap.nav else 0.0
-    newest = max(_quote_time(quotes[t]) for t in positions)
+    oldest = min(_quote_time(quotes[t]) for t in positions)
     today = today or datetime.now(NEW_YORK).date().isoformat()
-    stale = newest.date().isoformat() < today
+    stale = oldest.date().isoformat() < today
     tone = MUTED if stale else GREEN if change >= 0 else RED
-    when = newest.strftime("%b %-d %H:%M") if stale else newest.strftime("%H:%M")
+    when = oldest.strftime("%b %-d %H:%M") if stale else oldest.strftime("%H:%M")
     return [("Live", Text.assemble(
         (f"${value:,.0f}", MUTED if stale else TEXT),
         (f"   {change:+.2%}", tone),

@@ -32,6 +32,7 @@ from hedge_fund.data.sessions import completed_through, NEW_YORK, previous_day, 
 from hedge_fund.fund import Fund, FundSpec, TradingWindow
 from hedge_fund.paper.deployed import BROKER_FILE, load_deployed
 from hedge_fund.paper.ledger import Ledger
+from hedge_fund.ownership import owned_fund
 from hedge_fund.pipeline.clock import Clock, LiveClock, Marked
 from hedge_fund.pipeline.session import advance, FundHalted, FundState, is_rebalance_session, next_state, SessionRecord
 from hedge_fund.scorecard import current_allocation
@@ -149,6 +150,7 @@ def assessment_dates(state: FundState, session: str, spec: FundSpec) -> list[str
     return dates
 
 
+@owned_fund
 def tick(
     directory: str | Path,
     data_client: DataClient,
@@ -206,6 +208,7 @@ def print_day(time: str) -> str:
     return datetime.fromisoformat(time.replace("Z", "+00:00")).astimezone(NEW_YORK).date().isoformat()
 
 
+@owned_fund
 def redo(
     directory: str | Path,
     data_client: DataClient,

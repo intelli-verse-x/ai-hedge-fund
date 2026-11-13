@@ -11,9 +11,10 @@ backtest harness / portfolio construction decides timing and sizing.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from hedge_fund.data.protocol import DataClient
+from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.models import EarningsRecord
 from hedge_fund.models import Signal
 from hedge_fund.signals.base import QuantModel
@@ -62,8 +63,11 @@ class PEADModel(QuantModel):
         as_of = _parse_date(date)
         events = self._qualifying_events(ticker, data_client)
 
-        # Point-in-time: only consider filings on or before `date` (no lookahead)
-        past = [e for e in events if _parse_date(e["filing_date"]) <= as_of]
+        # Day-only filing dates do not prove availability at an intraday
+        # bar. Keep today's events out until the next calendar day; precise
+        # timestamped releases can still inform the separate intraday context.
+        cutoff = as_of - timedelta(days=1) if is_intraday(date) else as_of
+        past = [e for e in events if _parse_date(e["filing_date"]) <= cutoff]
         if not past:
             return self._neutral(ticker, date)
 

@@ -26,6 +26,7 @@ TUI, cron) can trade a halted fund by forgetting to look.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ from pathlib import Path
 from hedge_fund.data.bars import is_intraday, session_date
 from hedge_fund.pipeline.session import FundState, next_state, SessionRecord
 from hedge_fund.paths import write_atomic
+from hedge_fund.ownership import owned_ledger
 
 LEDGER_SUBDIR = "ledger"
 SUPERSEDED_SUBDIR = "superseded"  # records taken off the chain by a redo, kept
@@ -58,6 +60,7 @@ class Ledger:
 
     # ---- records ----------------------------------------------------------
 
+    @owned_ledger
     def init(self) -> None:
         """Create an empty ledger with the kill switch off."""
         self.records_dir.mkdir(parents=True, exist_ok=True)
@@ -102,6 +105,7 @@ class Ledger:
         sessions = self.sessions()
         return self.read(sessions[-1]) if sessions else None
 
+    @owned_ledger
     def append(self, record: SessionRecord) -> Path:
         """Append *record*, refusing a duplicate session, an out-of-order
         session, a broken hash chain, or a record whose hash is not its own."""
@@ -126,6 +130,7 @@ class Ledger:
         write_atomic(path, record.model_dump_json(indent=2))
         return path
 
+    @owned_ledger
     def rewind(self) -> SessionRecord:
         """Take the latest record off the chain so its session can be run
         again. The record is not destroyed: it moves to ledger/superseded/,
@@ -174,6 +179,7 @@ class Ledger:
     def checkpoint_path(self, day: str) -> Path:
         return self.records_dir / day / CHECKPOINT_FILE
 
+    @owned_ledger
     def checkpoint(self, state: FundState) -> Path:
         """Remember *state* as the state after its last session's day. Only a
         state whose last session is the newest recorded one can be kept:
@@ -186,7 +192,12 @@ class Ledger:
                 f"{self.directory.name}: checkpoint for {state.last_session} does not match the chain's head"
             )
         path = self.checkpoint_path(session_date(state.last_session))
-        write_atomic(path, state.model_dump_json(exclude={"halted"}, indent=2))
+        data = state.model_dump(mode="json", exclude={"halted"})
+        # This checksum detects corrupt cache state; it does not authenticate
+        # an operator or replace a full ledger verification.
+        write_atomic(path, json.dumps({
+            "schema_version": 1, "state": data, "state_sha256": _checkpoint_digest(data),
+        }, indent=2))
         self.log_event("checkpoint", session=state.last_session)
         return path
 
@@ -202,8 +213,18 @@ class Ledger:
             if before is not None and day >= before[:10]:
                 continue
             try:
-                state = FundState.model_validate_json(self.checkpoint_path(day).read_text())
-            except (OSError, ValueError):
+                payload = json.loads(self.checkpoint_path(day).read_text())
+                # Legacy, malformed or modified checkpoints are disposable:
+                # fall back to the authoritative event chain without edits.
+                if not isinstance(payload, dict) or set(payload) != {"schema_version", "state", "state_sha256"}:
+                    continue
+                if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+                    continue
+                data = payload["state"]
+                if not isinstance(data, dict) or payload["state_sha256"] != _checkpoint_digest(data):
+                    continue
+                state = FundState.model_validate(data)
+            except (OSError, ValueError, TypeError):
                 continue
             if state.last_session not in recorded or (before is not None and state.last_session >= before):
                 continue
@@ -233,6 +254,7 @@ class Ledger:
         self._write_control(True, reason)
         self.log_event("halt", reason=reason)
 
+    @owned_ledger
     def resume(self) -> None:
         self._write_control(False, None)
         self.log_event("resume")
@@ -257,3 +279,9 @@ class Ledger:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _checkpoint_digest(data: dict) -> str:
+    """Canonical cache integrity checksum, never an authorization signature."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
