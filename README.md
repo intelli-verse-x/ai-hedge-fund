@@ -2,7 +2,8 @@
 
 This is a proof of concept for an AI-powered hedge fund. The goal of this project is to explore the use of AI to make trading decisions. This project is for **educational** purposes only and is not intended for real trading or investment.
 
-> **🚧 The project is evolving.** We're rebuilding it into a persistent, always-on AI hedge fund — a *fund* as a first-class entity you can backtest, paper-trade, and (opt-in) run live, with the investor agents reimagined as pluggable, backtestable "alpha models." Read the **[Vision →](VISION.md)** and the **[Roadmap →](ROADMAP.md)**.
+<img width="2400" height="1460" alt="image" src="https://github.com/user-attachments/assets/e3985623-c226-4c1a-a587-e03fb4eca31e" />
+
 
 Note: the system does not actually make any trades.
 
@@ -38,8 +39,8 @@ aihf
 
 The app asks for keys the first time it needs them and saves them to `~/.hedge-fund/.env` — nothing to configure up front. It needs:
 
-- A [Financial Datasets](https://financialdatasets.ai) API key, for prices, fundamentals, and earnings.
-- One LLM API key for the LLM-powered alpha models. Supported providers: Anthropic, OpenAI, DeepSeek, Google, xAI, Kimi.
+- A [Financial Datasets](https://financialdatasets.ai) API key, for prices, fundamentals, and earnings. Or, instead of a key, the private key of a Base wallet holding USDC: every call then pays for itself with [x402](https://docs.financialdatasets.ai/x402) (`pip install 'aihf[x402]'`; last 365 days of data, non-professional use).
+- One model API key for the investor agents. Supported providers: Anthropic, OpenAI, DeepSeek, Google, xAI, Kimi, TypeSafe (Jev).
 
 Keys exported in your shell always win over the saved file.
 
@@ -51,23 +52,12 @@ Keys exported in your shell always win over the saved file.
 aihf
 ```
 
-With no arguments, this launches the interactive terminal app. Build a fund — pick stocks, strategies, rebalance cadence — or backtest a saved fund and watch its equity curve draw against its benchmark. Funds you build are saved as mandate files in `~/.hedge-fund/mandates/`.
+With no arguments, this launches the interactive terminal app. It has two modes:
 
-### Non-interactive
+- **Paper trading** — your funds, each with a ledger of real market days and fake money. Highlight a fund to see what its next run will do; press enter to run it through the next completed session (an approval step shows the exact decision about to execute before anything trades), `s` for its full session history, `h`/`r` for the kill switch. Build a new fund from the same list: strategies, capital, cadence, tickers, and it is live. Every session is appended to a hash-chained ledger in `~/.hedge-fund/paper/<name>/`, so NAV is a track record, not a reset.
+- **Backtesting** — replay a fund over history and watch its equity curve draw against its benchmark. Results are saved to `~/.hedge-fund/research/`. Fund definitions live in `~/.hedge-fund/mandates/` and carry no tickers; you pick the universe per backtest.
 
-Run one fund cycle from a mandate file. The full cycle record prints to stdout as JSON; a short human summary goes to stderr:
 
-```bash
-aihf ~/.hedge-fund/mandates/example.yaml --tickers AAPL,MSFT
-```
-
-Backtest the mandate over history at its rebalance cadence:
-
-```bash
-aihf ~/.hedge-fund/mandates/example.yaml --tickers AAPL,MSFT --backtest
-```
-
-A mandate is the desk — strategies, staff, risk, capital, cadence — and never names tickers; `--tickers` says what to point it at for this run.
 
 ## Development
 

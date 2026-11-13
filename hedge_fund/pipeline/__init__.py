@@ -1,8 +1,38 @@
-"""v2 pipeline — one code path (data -> analysts -> portfolio -> risk ->
-execution -> record) for backtest, paper, and live."""
+"""One pipeline: assess, execute at a later close, advance session by session."""
 
 from hedge_fund.pipeline.execution import build_orders
-from hedge_fund.pipeline.models import CycleRecord, StrategyRecord, TickerSkip
-from hedge_fund.pipeline.run_cycle import run_cycle
+from hedge_fund.pipeline.models import (
+    CycleRecord,
+    DecisionRecord,
+    StrategyRecord,
+    TickerSkip,
+)
+from hedge_fund.pipeline.session import (
+    advance,
+    BookMismatch,
+    FundHalted,
+    FundState,
+    is_rebalance_session,
+    next_state,
+    SessionRecord,
+)
+from hedge_fund.pipeline.stages import assess_fund, execute_decision, history_days, history_start
 
-__all__ = ["CycleRecord", "StrategyRecord", "TickerSkip", "build_orders", "run_cycle"]
+__all__ = [
+    "BookMismatch",
+    "CycleRecord",
+    "DecisionRecord",
+    "FundHalted",
+    "FundState",
+    "SessionRecord",
+    "StrategyRecord",
+    "TickerSkip",
+    "advance",
+    "assess_fund",
+    "build_orders",
+    "execute_decision",
+    "history_days",
+    "history_start",
+    "is_rebalance_session",
+    "next_state",
+]

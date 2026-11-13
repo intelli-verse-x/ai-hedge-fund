@@ -2,14 +2,13 @@
 
 import pytest
 
-from hedge_fund.backtesting.fund import backtest_fund, rebalance_grid
+from hedge_fund.backtesting.fund import backtest_fund, FundBacktestMetrics, rebalance_grid
 from hedge_fund.data.models import Price
 from hedge_fund.fund.spec import Fund, FundSpec
 from hedge_fund.models import Signal
 
-
 # ---------------------------------------------------------------------------
-# Fakes (date-aware variants of the run_cycle test fakes)
+# Fakes (date-aware variants of the session test fakes)
 # ---------------------------------------------------------------------------
 
 class FakeDataClient:
@@ -31,6 +30,9 @@ class FakeDataClient:
 class FakeAnalyst:
     """Fixed conviction per ticker, on every date."""
 
+    investment_approach = "long_short"
+    horizon_days = 1
+
     def __init__(self, name, views=None):
         self._name = name
         self._views = views or {}
@@ -44,32 +46,43 @@ class FakeAnalyst:
                       value=self._views.get(ticker, 0.0))
 
 
+@pytest.fixture(autouse=True)
+def registered_fakes(monkeypatch):
+    from hedge_fund.signals import ALPHA_MODEL_REGISTRY
+    for name in ("a", "b"):
+        monkeypatch.setitem(ALPHA_MODEL_REGISTRY, name, FakeAnalyst)
+
+
 def _spec(**overrides):
     base = dict(
+        schema_version=2,
         name="test-fund",
-        strategies=[{"name": "solo", "models": [{"name": "a"}]}],
+        strategies=[{"name": "solo", "models": [{"name": "a"}], "blend": {"mode": "long_short"}}],
         risk={"max_position_pct": 1.0, "max_gross_exposure": 1.0},
+        costs={"spread_bps": 0, "commission_per_share": 0, "impact_coefficient": 0},  # exact arithmetic below
         capital=100_000.0,
         rebalance="weekly",
     )
     return FundSpec(**{**base, **overrides})
 
 
-# Three trading weeks (Mon–Fri). Weekly grid = each Friday.
+# Three trading weeks (Mon–Fri). Weekly grid = each Monday (first session of
+# the ISO week), executed at Tuesday's close.
 WEEKDAYS = [
     "2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06", "2024-06-07",
     "2024-06-10", "2024-06-11", "2024-06-12", "2024-06-13", "2024-06-14",
     "2024-06-17", "2024-06-18", "2024-06-19", "2024-06-20", "2024-06-21",
 ]
+MONDAYS = ["2024-06-03", "2024-06-10", "2024-06-17"]
+TUESDAYS = ["2024-06-04", "2024-06-11", "2024-06-18"]
 FRIDAYS = ["2024-06-07", "2024-06-14", "2024-06-21"]
 
-# Closes chosen so 100k always targets exactly 500 AAPL shares — the fund
-# buys once and then correctly has nothing to trade.
+# The first Monday's views execute on Tuesday at 200; later daily marks move NAV.
 SERIES = {
-    "SPY": {day: close for day, close in
-            zip(FRIDAYS, [100.0, 102.0, 101.0])},
-    "AAPL": {day: close for day, close in
-             zip(FRIDAYS, [200.0, 210.0, 190.0])},
+    "SPY": {day: (100.0 if i < 9 else 102.0 if i < 14 else 101.0)
+            for i, day in enumerate(WEEKDAYS)},
+    "AAPL": {day: (200.0 if i < 9 else 210.0 if i < 14 else 190.0)
+             for i, day in enumerate(WEEKDAYS)},
 }
 
 
@@ -88,18 +101,23 @@ def test_grid_daily_is_identity():
     assert rebalance_grid(WEEKDAYS, "daily") == WEEKDAYS
 
 
-def test_grid_weekly_takes_last_trading_day_of_each_iso_week():
-    # A short holiday week (no Friday) still contributes its last day.
+def test_grid_weekly_takes_first_trading_day_of_each_iso_week():
+    # A short holiday week (no Monday) still contributes its first day.
     days = ["2024-06-27", "2024-06-28", "2024-07-01", "2024-07-02", "2024-07-05"]
-    assert rebalance_grid(days, "weekly") == ["2024-06-28", "2024-07-05"]
-    assert rebalance_grid(WEEKDAYS, "weekly") == FRIDAYS
+    assert rebalance_grid(days, "weekly") == ["2024-06-27", "2024-07-01"]
+    assert rebalance_grid(WEEKDAYS, "weekly") == MONDAYS
 
 
 def test_grid_monthly_splits_where_weekly_does_not():
     # Dec 30 2024 – Jan 3 2025 is ONE ISO week but TWO calendar months.
     days = ["2024-12-30", "2024-12-31", "2025-01-02", "2025-01-03"]
-    assert rebalance_grid(days, "weekly") == ["2025-01-03"]
-    assert rebalance_grid(days, "monthly") == ["2024-12-31", "2025-01-03"]
+    assert rebalance_grid(days, "weekly") == ["2024-12-30"]
+    assert rebalance_grid(days, "monthly") == ["2024-12-30", "2025-01-02"]
+
+
+def test_grid_first_day_is_always_a_rebalance():
+    # Starting mid-week still rebalances on day one: the rule looks back, never forward.
+    assert rebalance_grid(WEEKDAYS[2:], "weekly") == ["2024-06-05", "2024-06-10", "2024-06-17"]
 
 
 def test_grid_unknown_cadence_raises():
@@ -114,15 +132,18 @@ def test_grid_unknown_cadence_raises():
 def test_happy_path_hand_computed():
     result = _run()
 
-    assert result.dates == FRIDAYS
-    assert len(result.records) == 3
-    # Week 1: buy 500 @ 200 (full conviction, 100% cap). Weeks 2-3: the
-    # closes are chosen so the target stays exactly 500 shares — no churn.
-    assert result.records[0].positions == {"AAPL": 500}
-    assert result.nav == [100_000.0, 105_000.0, 95_000.0]
+    assert result.dates == WEEKDAYS
+    assert result.schema_version == 2
+    assert len(result.records) == len(WEEKDAYS)
+    assert [r.session for r in result.records] == WEEKDAYS
+    assert [r.session for r in result.records if r.rebalance] == MONDAYS
+    assert [r.session for r in result.records if r.executed] == TUESDAYS
+    # Buy 500 at the following Tuesday close; later prices require no churn.
+    assert result.cycles[0].positions == {"AAPL": 500}
+    assert result.nav == [100_000.0] * 9 + [105_000.0] * 5 + [95_000.0]
     assert result.metrics.n_orders == 1
     # Benchmark scaled to starting capital off its first grid close.
-    assert result.benchmark_nav == [100_000.0, 102_000.0, 101_000.0]
+    assert result.benchmark_nav == [100_000.0] * 9 + [102_000.0] * 5 + [101_000.0]
 
     m = result.metrics
     assert m.total_return_pct == pytest.approx(-0.05)
@@ -131,14 +152,61 @@ def test_happy_path_hand_computed():
     # Peak 105k -> trough 95k.
     assert m.max_drawdown_pct == pytest.approx(10_000 / 105_000, abs=1e-6)
     assert m.n_cycles == 3
+    # The book on each session record is the broker's book after that close.
+    assert result.records[0].positions == {}
+    assert result.records[1].positions == {"AAPL": 500}
+    assert result.records[-1].nav == 95_000.0
+    assert result.records[-1].decision is None  # Friday is not a rebalance session
+
+
+def test_metrics_report_what_the_fills_cost():
+    result = _run(spec=_spec(costs={"spread_bps": 5, "commission_per_share": 0.005}))
+    first = result.cycles[0]
+    assert first.fills[0].price == pytest.approx(200.10)
+    assert first.trading_cost == pytest.approx(52.50) and first.traded_notional == pytest.approx(100_050.0)
+    # Cycle 2 re-sizes 1.0 of equity (now 99,947.50) at 200: 499 shares, so
+    # one share is sold at 199.90 less $0.005 to pay for the first cycle.
+    second = result.cycles[1]
+    assert [(f.side, f.quantity, f.price) for f in second.fills] == [("sell", 1, pytest.approx(199.90))]
+    assert second.trading_cost == pytest.approx(0.105)
+    assert result.cycles[2].fills == []
+    m = result.metrics
+    assert m.trading_cost == pytest.approx(52.605, abs=0.01)
+    assert m.traded_notional == pytest.approx(100_249.90, abs=0.01)
+    # NAV is net of every cost: 147.395 cash + 499 × 190.
+    assert result.nav[-1] == pytest.approx(94_957.395)
+    # A result saved before costs existed reads back as free.
+    free = FundBacktestMetrics.model_validate({**m.model_dump(exclude={"trading_cost", "traded_notional"})})
+    assert free.trading_cost == 0.0 and free.traded_notional == 0.0
+
+
+def test_a_stopped_out_backtest_keeps_marking_to_the_end():
+    series = {
+        "SPY": {day: 100.0 for day in WEEKDAYS},
+        "AAPL": {day: (200.0 if i < 2 else 150.0 if i < 4 else 140.0) for i, day in enumerate(WEEKDAYS)},
+    }
+    result = _run(series, _spec(risk={"max_position_pct": 1.0, "max_gross_exposure": 1.0, "max_drawdown_pct": 0.20}))
+    assert len(result.records) == len(WEEKDAYS)
+    assert result.records[2].decision.is_stopped_out
+    assert result.cycles[1].positions == {}                       # Thursday's sale
+    assert result.nav[3:] == [pytest.approx(75_000.0)] * 12       # flat in cash to the end
+    assert all(r.decision is None for r in result.records[3:])
+    assert result.metrics.n_cycles == 2 and result.metrics.max_drawdown_pct == pytest.approx(0.25)
 
 
 def test_positions_carry_across_cycles_not_restart():
     result = _run()
-    # Same book all three weeks; only the marks moved.
-    assert [r.positions for r in result.records] == [{"AAPL": 500}] * 3
-    assert result.records[1].orders == []
-    assert result.records[2].orders == []
+    # Positions persist across executions; only the marks moved.
+    assert [r.positions for r in result.cycles] == [{"AAPL": 500}] * 3
+    assert result.cycles[1].orders == []
+
+
+def test_records_are_hash_chained():
+    result = _run()
+    assert result.records[0].prev_hash is None
+    for earlier, later in zip(result.records, result.records[1:]):
+        assert later.prev_hash == earlier.hash
+        assert earlier.hash == earlier.compute_hash()
 
 
 def test_deterministic_json_round_trip():
@@ -148,14 +216,14 @@ def test_deterministic_json_round_trip():
     assert FundBacktestResult.model_validate_json(first.model_dump_json()) == first
 
 
-def test_on_cycle_fires_per_tick_in_order():
+def test_on_cycle_fires_per_execution_in_order():
     seen = []
     spec = _spec()
     fund = Fund(spec, models={"solo": [FakeAnalyst("a", views={"AAPL": 1.0})]})
     backtest_fund(fund, "2024-06-03", "2024-06-21", FakeDataClient(SERIES),
                   ["AAPL"],
-                  on_cycle=lambda i, n, record: seen.append((i, n, record.as_of)))
-    assert seen == [(0, 3, FRIDAYS[0]), (1, 3, FRIDAYS[1]), (2, 3, FRIDAYS[2])]
+                  on_cycle=lambda i, n, record: seen.append((i, n, record.as_of, record.execution_as_of)))
+    assert seen == [(i, 3, MONDAYS[i], TUESDAYS[i]) for i in range(3)]
 
 
 def test_universe_round_trips_onto_the_result():
@@ -163,6 +231,7 @@ def test_universe_round_trips_onto_the_result():
     result = _run()
     assert result.universe == ["AAPL"]
     assert all(r.universe == ["AAPL"] for r in result.records)
+    assert all(r.universe == ["AAPL"] for r in result.cycles)
 
 
 def test_missing_benchmark_raises():
@@ -174,5 +243,166 @@ def test_missing_benchmark_raises():
 def test_grid_follows_mandate_cadence():
     spec = _spec(rebalance="monthly")
     result = _run(spec=spec)
-    assert result.dates == ["2024-06-21"]  # one June rebalance
+    assert result.dates == WEEKDAYS
+    # One month, so one rebalance: the first session, executed the next day.
+    assert [r.session for r in result.records if r.rebalance] == ["2024-06-03"]
+    assert [r.execution_as_of for r in result.cycles] == ["2024-06-04"]
     assert result.rebalance == "monthly"
+
+
+@pytest.mark.parametrize("mode", ["long_only", "long_short", "dollar_neutral"])
+def test_backtest_enforces_each_mode_with_mixed_analysts(mode):
+    spec = _spec(strategies=[{"name": "mixed", "models": [{"name": "buffett"}, {"name": "druckenmiller"}], "blend": {"mode": mode}}])
+    fund = Fund(spec, models={"mixed": [FakeAnalyst(name, {"AAPL": .8, "MSFT": -.6}) for name in ("buffett", "druckenmiller")]})
+    series = {"SPY": {day: 100 for day in FRIDAYS}, "AAPL": {day: 100 for day in FRIDAYS}, "MSFT": {day: 100 for day in FRIDAYS}}
+    result = backtest_fund(fund, FRIDAYS[0], FRIDAYS[-1], FakeDataClient(series), ["AAPL", "MSFT"])
+    assert len(result.cycles) == 2  # three sessions in three ISO weeks: two executions
+    assert result.nav == [100_000] * 3
+    for record in result.cycles:
+        assert record.positions["AAPL"] > 0
+        if mode == "long_only":
+            assert record.positions.get("MSFT", 0) == 0
+        else:
+            assert record.positions["MSFT"] < 0
+        if mode == "dollar_neutral":
+            assert sum(record.final_weights.values()) == pytest.approx(0)
+
+
+def test_daily_callbacks_capture_losses_between_rebalances_and_after_last_trade():
+    daily = []
+    cycles = []
+    series = {ticker: dict(values) for ticker, values in SERIES.items()}
+    series["AAPL"]["2024-06-12"] = 100
+    fund = Fund(_spec(), models={"solo": [FakeAnalyst("a", {"AAPL": 1})]})
+    result = backtest_fund(fund, WEEKDAYS[0], WEEKDAYS[-1], FakeDataClient(series), ["AAPL"],
+                           on_cycle=lambda i, n, r: cycles.append((i, n, r)),
+                           on_valuation=lambda i, n, v: daily.append((i, n, v)))
+    assert len(daily) == 15
+    assert len(cycles) == 3
+    assert daily[7][2].nav == 50_000
+    assert result.metrics.max_drawdown_pct == .5
+    assert result.nav[-1] == 95_000
+    assert [v.nav for _, _, v in daily] == result.nav
+    assert [r.execution_as_of for _, _, r in cycles] == TUESDAYS
+
+
+def test_single_session_window_is_cash_with_an_unexecuted_decision():
+    fund = Fund(_spec(), models={"solo": [FakeAnalyst("a", {"AAPL": 1})]})
+    result = backtest_fund(fund, FRIDAYS[0], FRIDAYS[0], FakeDataClient(SERIES), ["AAPL"])
+    assert result.nav == result.benchmark_nav == [100_000]
+    assert result.cycles == []
+    assert result.records[0].decision is not None
+    assert result.records[0].decision.final_weights == {"AAPL": 1}
+    assert result.metrics.n_cycles == 0
+    assert result.metrics.total_return_pct == 0
+    assert result.metrics.annualized_return_pct == 0
+    assert result.metrics.max_drawdown_pct == 0
+    assert result.metrics.sharpe_ratio == 0
+
+
+def test_missing_daily_mark_for_held_ticker_stops_replay():
+    series = {ticker: dict(values) for ticker, values in SERIES.items()}
+    del series["AAPL"]["2024-06-12"]
+    with pytest.raises(ValueError, match="AAPL.*2024-06-12"):
+        _run(series)
+
+
+def test_daily_sharpe_uses_consecutive_returns_without_initial_zero():
+    import numpy as np
+    from hedge_fund.backtesting.fund import performance_metrics
+    nav = [100, 110, 99, 118.8]
+    dates = ["2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06"]
+    result = performance_metrics(100, dates, nav, [100] * 4, [])
+    returns = np.array([.1, -.1, .2])
+    assert result.sharpe_ratio == pytest.approx(returns.mean() / returns.std(ddof=1) * np.sqrt(252), abs=1e-4)
+    assert result.n_cycles == 0
+
+
+def test_schedule_lists_rebalance_and_execution_sessions():
+    from hedge_fund.backtesting.fund import build_schedule
+    schedule = build_schedule(FakeDataClient(SERIES), "SPY", WEEKDAYS[0], WEEKDAYS[-1], "weekly")
+    assert schedule.execution_dates == dict(zip(MONDAYS, TUESDAYS))
+    assert schedule.assessment_dates == MONDAYS
+    assert schedule.warm_dates == sorted(set(MONDAYS) | set(TUESDAYS))   # liquidity at each execution too
+    daily = build_schedule(FakeDataClient(SERIES), "SPY", "2024-06-03", "2024-06-04", "daily")
+    assert daily.execution_dates == {"2024-06-03": "2024-06-04", "2024-06-04": None}
+    assert daily.assessment_dates == ["2024-06-03", "2024-06-04"]
+    assert daily.warm_dates == ["2024-06-03", "2024-06-04"]
+
+
+def test_backtest_excludes_current_session_even_if_provider_returns_it(monkeypatch):
+    from datetime import datetime
+    from hedge_fund.data import sessions
+    class Clock:
+        @staticmethod
+        def now(tz):
+            return datetime(2024, 6, 10, 23, tzinfo=tz)
+    monkeypatch.setattr(sessions, "datetime", Clock)
+    result = _run()
+    assert result.dates == WEEKDAYS[:5]
+    assert [r.execution_as_of for r in result.cycles] == ["2024-06-04"]
+    assert result.records[-1].decision is None
+    assert result.nav == [100_000] * 5
+
+
+def test_daily_replay_executes_the_prior_decision_then_assesses_anew():
+    events = []
+    class ObservedAnalyst(FakeAnalyst):
+        def predict(self, ticker, date, data_client):
+            events.append(("assessment", date))
+            return super().predict(ticker, date, data_client)
+    fund = Fund(_spec(rebalance="daily"), models={"solo": [ObservedAnalyst("a", {"AAPL": 1})]})
+    result = backtest_fund(fund, WEEKDAYS[0], WEEKDAYS[1], FakeDataClient(SERIES), ["AAPL"],
+                           on_cycle=lambda i, n, r: events.append(("execution", r.execution_as_of)),
+                           on_valuation=lambda i, n, v: events.append(("valuation", v.as_of)))
+    assert events == [("assessment", "2024-06-03"), ("valuation", "2024-06-03"),
+                      ("assessment", "2024-06-04"), ("execution", "2024-06-04"),
+                      ("valuation", "2024-06-04")]
+    first, second = result.records
+    assert first.executed is None and first.decision.as_of == "2024-06-03"
+    assert second.executed.as_of == "2024-06-03" and second.executed.execution_as_of == "2024-06-04"
+    assert second.decision.as_of == "2024-06-04"  # made after the execution, still pending
+
+
+# ---------------------------------------------------------------------------
+# minute funds
+# ---------------------------------------------------------------------------
+
+class DailyOnly(FakeDataClient):
+    """Financial Datasets as it is: daily bars, and nothing finer."""
+
+    def get_prices(self, ticker, start_date, end_date, interval="day", interval_multiplier=1):
+        if interval != "day":
+            raise RuntimeError("GET /prices/ returned 400: Invalid interval")
+        return super().get_prices(ticker, start_date, end_date)
+
+
+def test_a_minute_fund_backtests_at_daily_closes_as_the_daily_fund_it_collapses_to():
+    """A minute fund decides every bar and fills at the next. On a daily
+    grid that is: decide at every close, fill at the next — a daily fund.
+    The sessions, fills and metrics match the daily mandate exactly, no
+    minute bars are asked for, and the cadence says how it was replayed."""
+    days = ["2024-06-03", "2024-06-04", "2024-06-05"]
+    series = {"SPY": {d: 500.0 for d in days}, "AAPL": dict(zip(days, (100.0, 104.0, 110.0)))}
+    results = {}
+    for cadence in ("minute", "daily"):
+        overrides = {"interval": 10, "window": {"start": "13:00", "end": "13:10"}} if cadence == "minute" else {}
+        fund = Fund(_spec(rebalance=cadence, **overrides), models={"solo": [FakeAnalyst("a", views={"AAPL": 1.0})]})
+        results[cadence] = backtest_fund(fund, days[0], days[-1], DailyOnly(series), ["AAPL"])
+    minute, daily = results["minute"], results["daily"]
+    assert minute.rebalance == "daily (mandate: every 10m · 13:00–13:10 ET)" and daily.rebalance == "daily"
+    assert minute.dates == daily.dates == days
+    assert minute.nav == daily.nav and minute.metrics == daily.metrics
+    assert minute.records[1].executed.execution_policy == "next_close"
+    assert minute.records[1].executed.fills[0].price == 104.0 and minute.metrics.n_cycles == 2
+
+
+def test_a_mandate_with_an_allocator_records_the_weights_each_decision_used():
+    result = _run(spec=_spec(allocation={}))
+    decisions = [r.decision for r in result.records if r.decision is not None]
+    assert [d.allocation.as_of for d in decisions] == MONDAYS
+    # Three weeks is far short of the evidence: every weight is the mandate's.
+    assert [d.allocation.strategies["solo"].weight for d in decisions] == [1.0, 1.0, 1.0]
+    assert [d.allocation.strategies["solo"].n for d in decisions] == [0, 0, 1]
+    assert all(r.hash == r.compute_hash() for r in result.records)
+    assert all(r.decision.allocation is None for r in _run().records if r.decision is not None)

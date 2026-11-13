@@ -1,0 +1,303 @@
+"""The pipeline's two stages: assess views, then execute them at a later close.
+
+`assess_fund` runs the analysts as of a completed session and turns their
+views into validated target weights (a DecisionRecord — no orders, no
+broker). `execute_decision` sizes that decision against the broker's book at
+a subsequent session's exact closing prices and returns the CycleRecord.
+`hedge_fund.pipeline.session.advance` sequences the two across sessions;
+nothing here knows about the clock.
+"""
+
+from __future__ import annotations
+
+from datetime import date as _date
+from datetime import timedelta
+from math import isfinite, log
+from statistics import stdev
+
+from hedge_fund.brokers.models import Fill, Liquidity, Order
+from hedge_fund.brokers.protocol import Broker
+from hedge_fund.data.protocol import DataClient
+from hedge_fund.fund import Fund, FundSpec, normalize_universe
+from hedge_fund.models import Signal
+from hedge_fund.pipeline.clock import Clock, clock_for, daily_history_cutoff, execution_policy, PinnedQuotes
+from hedge_fund.pipeline.execution import build_orders
+from hedge_fund.pipeline.models import (
+    AllocationRecord,
+    CycleRecord,
+    DecisionRecord,
+    StrategyRecord,
+    TickerSkip,
+)
+from hedge_fund.portfolio.construction import blend_signals, WEIGHT_TOLERANCE
+from hedge_fund.portfolio.validation import validate_targets
+from hedge_fund.risk.exposures import exposures
+from hedge_fund.risk.limits import apply_limits, ClampEvent
+from hedge_fund.signals import get_investment_approach
+
+# The one window of daily history the pipeline fetches at a date: 30 calendar
+# days, enough for the 20 bars liquidity needs; 100 days (about 68 trading
+# bars, over the model's 60-bar minimum) when a factor limit needs betas
+# fitted on it. Short on purpose: with the 260-day default backtest the
+# replay stays inside the 365 days x402 serves a wallet.
+_HISTORY_DAYS = 30
+_FACTOR_HISTORY_DAYS = 100
+_LIQUIDITY_BARS = 20
+# A mark must be fresher than this: covers weekends, holiday clusters, and
+# short trading halts without reaching into stale history.
+_MARK_LOOKBACK_DAYS = 7
+
+
+def assess_fund(
+    fund: Fund, as_of: str, data_client: DataClient, universe: list[str],
+    clock: Clock | None = None, allocation: AllocationRecord | None = None,
+    drawdown: float = 0.0,
+) -> DecisionRecord:
+    """Construct validated target weights using only the assessment cutoff.
+    *allocation* is what the scorecard made of the mandate's weights; without
+    one, every slice and blend weight is as the mandate wrote it. *drawdown*
+    is the fund's fall from its NAV peak, which the halving tier reads."""
+    clock = clock or clock_for(fund.spec, data_client)
+    if not clock.is_complete(as_of):
+        raise ValueError(f"assessment {as_of} requires incomplete data")
+    spec = fund.spec.model_copy(deep=True)
+    universe = normalize_universe(universe)
+    session_date = daily_history_cutoff(as_of)
+    start = history_start(session_date, history_days(spec))
+    marks, skipped = _mark_prices(universe, session_date, data_client, start)
+
+    tradeable = [t for t in universe if t in marks]
+    # Analysts read the session's print, not the wire: the same price the
+    # engine marks and executes with, and nothing from after the session.
+    view = PinnedQuotes(data_client, clock, as_of)
+
+    # Each strategy runs its own analysts and blends its own sleeve; the fund
+    # nets the sleeves by capital slice. A persona staffed into two strategies
+    # is asked twice, but the second ask is a prompt-cache hit, not spend.
+    slices = {
+        s.name: allocation.strategies[s.name].weight if allocation is not None else s.weight
+        for s, _ in fund.strategies
+    }
+    total_slice = sum(slices.values())
+    strategy_records: list[StrategyRecord] = []
+    netted: dict[str, float] = {t: 0.0 for t in tradeable}
+    for strategy, staff in fund.strategies:
+        signals: list[Signal] = []
+        for ticker in tradeable:
+            for model in staff:
+                # The model declares its horizon; the engine stamps it on the
+                # view, so no analyst has to remember to.
+                signals.append(model.predict(ticker, as_of, view).model_copy(
+                    update={"horizon_days": model.horizon_days}))
+        model_weights = (
+            {m: a.weight for m, a in allocation.models[strategy.name].items()}
+            if allocation is not None else strategy.model_weights
+        )
+        blend = blend_signals(
+            signals, model_weights, strategy.blend.gross_target,
+            mode=strategy.blend.mode,
+            investment_approaches={m.name: get_investment_approach(m.name) for m in strategy.models},
+        )
+        slice_ = slices[strategy.name] / total_slice
+        for ticker, weight in blend.weights.items():
+            netted[ticker] += slice_ * weight
+        strategy_records.append(StrategyRecord(
+            name=strategy.name,
+            slice=slice_,
+            signals=signals,
+            convictions=blend.convictions,
+            weights=blend.weights,
+            eligible_scores=blend.eligible_scores,
+            flat_reason=blend.flat_reason,
+        ))
+
+    preserve_proportions = any(s.blend.mode == "dollar_neutral" for s in spec.strategies)
+    exposure = (exposures(tradeable, spec.benchmark, session_date, data_client, start)
+                if spec.risk.has_factor_limits else None)
+    risk = apply_limits(netted, spec.risk, preserve_proportions=preserve_proportions,
+                        drawdown=drawdown, exposures=exposure)
+    if risk.scale_factor is not None:
+        multipliers = dict.fromkeys(netted, risk.scale_factor)
+    else:
+        # Exactly offset contributions stay visible even though no net trade remains.
+        multipliers = {ticker: risk.weights[ticker] / weight if weight != 0 else 1.0 for ticker, weight in netted.items()}
+    for record in strategy_records:
+        record.final_contribution = {
+            ticker: record.slice * weight * multipliers[ticker]
+            for ticker, weight in record.weights.items()
+        }
+    validate_targets(spec, strategy_records, risk.weights, allocation)
+
+    return DecisionRecord(
+        fund=spec.name, as_of=as_of, spec=spec, universe=universe,
+        marks=marks, skipped=skipped, strategies=strategy_records,
+        target_weights=netted, clamps=risk.clamps,
+        risk_scale_factor=risk.scale_factor, final_weights=risk.weights,
+        allocation=allocation,
+        drawdown=drawdown if spec.risk.halve_drawdown_pct is not None else None,
+        exposures=exposure,
+    )
+
+
+def execute_decision(
+    fund: Fund, original: DecisionRecord, session: str,
+    broker: Broker, data_client: DataClient, clock: Clock | None = None,
+) -> CycleRecord:
+    """Refresh views before sizing a complete rebalance at exact session prices."""
+    clock = clock or clock_for(fund.spec, data_client)
+    if session <= original.as_of or not clock.is_complete(session):
+        raise ValueError(f"execution session {session} must follow {original.as_of} and be complete")
+    if fund.spec != original.spec:
+        raise ValueError("fund mandate changed after assessment; create a new assessment")
+    cutoff = clock.previous(session)
+    # A stop-out is never refreshed: the analysts were not asked, and asking
+    # them across a calendar gap would put the book back on.
+    effective = original if cutoff == original.as_of or original.is_stopped_out else assess_fund(
+        fund, cutoff, data_client, original.universe, clock, original.allocation,
+        drawdown=original.drawdown or 0.0,
+    )
+    spec = effective.spec
+    validate_targets(spec, effective.strategies, effective.final_weights, effective.allocation)
+    held = broker.positions()
+    targets = {t: w for t, w in effective.final_weights.items() if w != 0}
+    marks = clock.marks(list(set(held) | set(targets)), session).prices
+    cash_before = broker.cash()
+    equity_before = cash_before + sum(p.shares * marks[t] for t, p in held.items())
+    if not isfinite(equity_before) or equity_before <= 0:
+        raise ValueError(f"{spec.name}: equity on {session} must be finite and positive")
+    liquid = liquidity(sorted(set(held) | set(targets)), daily_history_cutoff(session), data_client,
+                       history_days(spec))
+    max_shares: dict[str, int] | None = None
+    if spec.risk.max_adv_pct is not None:
+        max_shares = {t: int(spec.risk.max_adv_pct * name.adv) for t, name in liquid.items()}
+    min_notional = spec.costs.min_trade_pct * equity_before
+    orders = build_orders(targets, held, marks, equity_before, max_shares, min_notional, liquid)
+    projected = {t: p.shares for t, p in held.items()}
+    for order in orders:
+        projected[order.ticker] = projected.get(order.ticker, 0) + (
+            order.quantity if order.side == "buy" else -order.quantity
+        )
+    weights = {t: shares * marks[t] / equity_before for t, shares in projected.items()}
+    liquidity_clamps: list[ClampEvent] = []
+    if max_shares is not None:
+        wanted = {o.ticker: o.quantity for o in build_orders(targets, held, marks, equity_before, min_notional=min_notional)}
+        got = {o.ticker: o.quantity for o in orders}
+        for ticker in sorted(wanted):
+            if got.get(ticker, 0) < wanted[ticker]:
+                liquidity_clamps.append(ClampEvent(
+                    limit="max_adv_pct", ticker=ticker,
+                    before=targets.get(ticker, 0.0), after=weights.get(ticker, 0.0),
+                ))
+    for ticker, weight in weights.items():
+        if not isfinite(weight) or abs(weight) > spec.risk.max_position_pct + WEIGHT_TOLERANCE:
+            raise ValueError(f"{ticker}: projected position violates max_position_pct")
+    if sum(abs(w) for w in weights.values()) > spec.risk.max_gross_exposure + WEIGHT_TOLERANCE:
+        raise ValueError("projected portfolio violates max_gross_exposure")
+    fills: list[Fill] = [broker.place_order(order) for order in orders]
+    positions = {t: p.shares for t, p in broker.positions().items()}
+    cash = broker.cash()
+    fields = effective.model_dump(exclude={"as_of", "marks", "clamps"})
+    return CycleRecord(
+        **fields, as_of=original.as_of, marks=marks, clamps=[*effective.clamps, *liquidity_clamps],
+        equity_before=equity_before, cash_before=cash_before,
+        orders=orders, fills=fills, positions=positions, cash=cash,
+        nav=cash + sum(shares * marks[t] for t, shares in positions.items()),
+        original_assessment=original.model_copy(deep=True),
+        refreshed_assessment=effective.model_copy(deep=True),
+        execution_as_of=session, execution_policy=execution_policy(session),
+    )
+
+
+def stop_out_decision(
+    spec: FundSpec, as_of: str, universe: list[str], marks: dict[str, float],
+    positions: dict[str, int], drawdown: float,
+) -> DecisionRecord:
+    """The decision a drawdown stop-out makes: close every held name, ask no
+    analyst. One whole-book clamp records the drawdown that fired it."""
+    total_slice = sum(s.weight for s in spec.strategies)
+    flat = {ticker: 0.0 for ticker in sorted(positions)}
+    return DecisionRecord(
+        fund=spec.name, as_of=as_of, spec=spec, universe=universe,
+        marks={ticker: marks[ticker] for ticker in sorted(positions)}, skipped=[],
+        strategies=[
+            StrategyRecord(name=strategy.name, slice=strategy.weight / total_slice, signals=[],
+                           convictions={}, weights={}, flat_reason="no_eligible_positions")
+            for strategy in spec.strategies
+        ],
+        target_weights=flat, final_weights=flat,
+        clamps=[ClampEvent(limit="max_drawdown_pct", before=drawdown, after=0.0)],
+    )
+
+
+def liquidity(
+    tickers: list[str], as_of: str, data_client: DataClient, days: int = _HISTORY_DAYS,
+) -> dict[str, Liquidity]:
+    """Each name's liquidity from its last 20 daily bars on or before *as_of*
+    (fewer when fewer printed): mean volume, and the sample sigma of the
+    daily log returns. A name with no bars is absent: a missing number must
+    not silently freeze a name, so it trades uncapped and pays no impact.
+    Fewer than three bars give no sigma, and the name pays no impact either.
+    *days* is the mandate's history window, so the fetch is the one the
+    marks made.
+
+    Daily bars price a minute fund's orders too: a bar's order is measured
+    against a whole day's volume, which overstates what a bar can absorb."""
+    start = history_start(as_of, days)
+    liquid: dict[str, Liquidity] = {}
+    for ticker in tickers:
+        bars = [p for p in data_client.get_prices(ticker, start, as_of) if start <= p.time[:10] <= as_of]
+        recent = sorted(bars, key=lambda p: p.time)[-_LIQUIDITY_BARS:]
+        if not recent:
+            continue
+        returns = [log(b.close / a.close) for a, b in zip(recent, recent[1:])]
+        liquid[ticker] = Liquidity(
+            adv=sum(p.volume for p in recent) / len(recent),
+            volatility=stdev(returns) if len(returns) >= 2 else 0.0,
+        )
+    return liquid
+
+
+def history_start(as_of: str, days: int = _HISTORY_DAYS) -> str:
+    """The first date of the daily history the pipeline fetches for *as_of*:
+    *days* back, one window that serves the mark, the liquidity, and the
+    factor model. The backtest warm fetches exactly this window."""
+    return (_date.fromisoformat(as_of) - timedelta(days=days)).isoformat()
+
+
+def history_days(spec: FundSpec) -> int:
+    """How far back the mandate's history window reaches: 100 days when a
+    factor limit fits betas on it, else the 30 days liquidity needs."""
+    return _FACTOR_HISTORY_DAYS if spec.risk.has_factor_limits else _HISTORY_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def _mark_prices(
+    tickers: list[str],
+    as_of: str,
+    data_client: DataClient,
+    start: str,
+) -> tuple[dict[str, float], list[TickerSkip]]:
+    """Analytical lookback marks; names without a fresh close are excluded
+    from assessment. Fetches the full history window from *start*, so the
+    liquidity and factor fetches at the same date are cache hits."""
+    fresh = (_date.fromisoformat(as_of) - timedelta(days=_MARK_LOOKBACK_DAYS)).isoformat()
+    marks: dict[str, float] = {}
+    skipped: list[TickerSkip] = []
+
+    for ticker in tickers:
+        prices = data_client.get_prices(ticker, start, as_of)
+        bars = [p for p in prices if fresh <= p.time[:10] <= as_of]
+        if bars:
+            marks[ticker] = max(bars, key=lambda p: p.time).close
+            if not isfinite(marks[ticker]) or marks[ticker] <= 0:
+                raise ValueError(f"{ticker}: analytical close on {as_of} must be finite and positive")
+        else:
+            skipped.append(TickerSkip(
+                ticker=ticker,
+                reason=f"no close within {_MARK_LOOKBACK_DAYS} days of {as_of}",
+            ))
+
+    return marks, skipped

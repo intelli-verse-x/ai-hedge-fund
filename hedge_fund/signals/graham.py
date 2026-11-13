@@ -14,6 +14,9 @@ from hedge_fund.signals.llm_agent import LLMAgent
 class GrahamAgent(LLMAgent):
     """Reasons over fundamentals in Benjamin Graham's voice."""
 
+    investment_approach = "long_only"
+    horizon_days = 252  # net-net plays ran two to three years; graded at one
+
     @property
     def name(self) -> str:
         return "graham"

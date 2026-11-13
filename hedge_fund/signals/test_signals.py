@@ -106,7 +106,39 @@ class TestPEADPredict:
         assert sig.value == 1.0
         assert sig.metadata["source_type"] == "8-K"
 
+    def test_10q_only_period_is_neutral(self):
+        # No 8-K for the period — 10-Q filing date is not the announcement
+        fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT", source_type="10-Q")])
+        sig = PEADModel().predict("TEST", "2025-08-01", fd)
+        assert sig.value == 0.0
+
+    def test_10q_fallback_when_announcement_only_false(self):
+        fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT", source_type="10-Q")])
+        sig = PEADModel(announcement_only=False).predict("TEST", "2025-08-01", fd)
+        assert sig.value == 1.0
+        assert sig.metadata["source_type"] == "10-Q"
+
+    def test_dedup_earliest_8k_wins(self):
+        # Two 8-Ks for the same period; keep the earlier filing date
+        fd = MockFDClient([
+            _rec("2025-06-30", "2025-08-15", "BEAT", source_type="8-K"),
+            _rec("2025-06-30", "2025-08-01", "BEAT", source_type="8-K"),
+        ])
+        sig = PEADModel().predict("TEST", "2025-08-01", fd)
+        assert sig.value == 1.0
+        assert sig.metadata["filing_date"] == "2025-08-01"
+
     def test_returns_signal_type(self):
         fd = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
         sig = PEADModel().predict("TEST", "2025-08-01", fd)
         assert isinstance(sig, Signal)
+
+
+def test_intraday_pead_excludes_day_only_same_day_filings_but_daily_mode_keeps_them():
+    client = MockFDClient([_rec("2025-06-30", "2025-08-01", "BEAT")])
+    model = PEADModel()
+    for bar in ("2025-08-01T09:30:00", "2025-08-01T16:00:00"):
+        assert model.predict("TEST", bar, client).value == 0.0
+    assert model.predict("TEST", "2025-08-01", client).value == 1.0
+    assert model.predict("TEST", "2025-08-04T09:30:00", client).value == 1.0
+    assert model.predict("TEST", "2025-08-06T09:30:00", client).value == 0.0

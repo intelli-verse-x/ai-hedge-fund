@@ -8,7 +8,6 @@ rich renderables (which Textual Statics render natively).
 
 from __future__ import annotations
 
-import json
 from datetime import date as _date
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
@@ -16,10 +15,9 @@ from pathlib import Path
 
 from rich.text import Text
 
-from hedge_fund.fund import FundSpec, StrategySpec
-from hedge_fund.llm import is_supported, load_api_models  # noqa: F401  (re-export)
-from hedge_fund.paths import MANDATES_DIR, ensure_mandates_dir  # noqa: F401  (re-export)
-from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent
+from hedge_fund.data.bars import is_intraday
+from hedge_fund.fund import FundSpec, PortfolioMode, StrategySpec
+from hedge_fund.signals import ALPHA_MODEL_REGISTRY, get_investment_approach, LLMAgent
 
 try:
     VERSION = _version("aihf")
@@ -27,9 +25,9 @@ except PackageNotFoundError:  # running from source without an install
     VERSION = "dev"
 
 # Strategy libraries live in hedge_fund/strategies/ (code, inside the package).
-# Mandates the app writes are user data and live in ~/.hedge-fund/ (see paths.py).
+# Mandates, paper funds and backtest results the app writes are user data
+# and live in ~/.hedge-fund/ (see paths.py).
 STRATEGY_DIR = Path(__file__).resolve().parent.parent / "strategies"
-FUNDS_DIR = MANDATES_DIR
 
 UNIVERSE_PRESETS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
                     "META", "TSLA", "JPM", "UNH", "XOM"]
@@ -43,7 +41,7 @@ DISPLAY_NAMES = {
     "pead": "post-earnings drift",
 }
 
-_SHORT_NAMES = {
+SHORT_NAMES = {
     "buffett": "Buffett",
     "munger": "Munger",
     "graham": "Graham",
@@ -52,27 +50,52 @@ _SHORT_NAMES = {
     "pead": "PEAD",
 }
 
+MODE_LABELS: dict[PortfolioMode, str] = {"long_only": "Long-only", "long_short": "Long/short", "dollar_neutral": "Dollar-neutral"}
+
+
+def horizon_label(days: int) -> str:
+    """`60d`, `1y`, `2y`: a horizon in trading days, as a desk says it."""
+    if days % 252 == 0:
+        return f"{days // 252}y"
+    return f"{days}d"
+
+
 # The LLM the investor agents reason with. Picked once, upfront; make_llm()
 # reads HEDGE_FUND_LLM_MODEL (hedge_fund/llm/client.py) and routes to the right provider, so
 # setting that env var steers every agent instance — the warm roster AND the
 # Fund — with no threading. Quant models (PEAD) carry no LLM and ignore it.
-_DEFAULT_MODEL_LABEL = "Opus 5"
+DEFAULT_MODEL_LABEL = "Opus 5.5"
 
-# The registry lives in hedge_fund/llm — it is a fact about providers, not about
-# presentation. Re-exported here so screens keep importing from one place.
-
-
-DEFAULT_RISK = {"max_position_pct": 0.25, "max_gross_exposure": 1.0}
+DEFAULT_RISK = {"max_position_pct": 0.25, "max_gross_exposure": 1.0,
+                "halve_drawdown_pct": 0.10, "max_drawdown_pct": 0.20}
+DEFAULT_ALLOCATION: dict = {}  # the allocator at its defaults: the scorecard moves the weights
 DEFAULT_CAPITAL = 100_000.0
-_BACKTEST_WEEKS = 78  # ~18 months of history for the default backtest window
-_CYCLE_DWELL = 0.08   # min seconds per backtest tick, so the curve draws visibly
-_BOARD_REFRESH = 1 / 12  # seconds between run-board repaints — smooth, not frantic
-_WARM_CHUNK = 10      # dates per warm task — small enough that one stock still fans out
+# The default backtest window. With the 100-day factor warm-up the replay
+# reaches 360 days back, inside the 365 days x402 serves a wallet.
+BACKTEST_DAYS = 260
+BOARD_REFRESH = 1 / 12  # seconds between run-board repaints — smooth, not frantic
+WARM_CHUNK = 10      # dates per warm task — small enough that one stock still fans out
 
 _CHART_HEIGHT = 8
 
 
-def _valid_date(text: str):
+def strategy_description(strategy: StrategySpec) -> str:
+    """Explain permissions without treating every negative view as a short."""
+    label = MODE_LABELS[strategy.blend.mode]
+    short_names = [SHORT_NAMES.get(m.name, m.name) for m in strategy.models
+                   if get_investment_approach(m.name) == "long_short"]
+    if strategy.blend.mode == "long_only":
+        return f"{label}: buy stocks or hold cash; no shorts."
+    prefix = ("balance long and short dollar exposure (not market risk). "
+              if strategy.blend.mode == "dollar_neutral" else "buy and short stocks. ")
+    support = (f"Short ideas must be supported by {', '.join(short_names)}."
+               if short_names else "No selected analyst can support short ideas.")
+    if len(short_names) < len(strategy.models):
+        support += " Long-only analysts contribute ownership views."
+    return f"{label}: {prefix}{support}"
+
+
+def valid_date(text: str):
     try:
         _date.fromisoformat(text.strip())
         return True
@@ -80,15 +103,15 @@ def _valid_date(text: str):
         return "Use YYYY-MM-DD."
 
 
-def _fund_label(spec: FundSpec) -> str:
+def fund_label(spec: FundSpec) -> str:
     """One aligned line per fund: name, staff, cadence."""
-    staff = ", ".join(s.title for s in spec.strategies[:3])
+    staff = ", ".join(f"{s.title} ({MODE_LABELS[s.blend.mode]})" for s in spec.strategies[:3])
     if len(spec.strategies) > 3:
         staff += ", …"
-    return f"{spec.name:<18} {staff} · {spec.rebalance}"
+    return f"{spec.name:<18} {staff} · {spec.cadence_label}"
 
 
-def _agent_names(spec: FundSpec) -> list[str]:
+def agent_names(spec: FundSpec) -> list[str]:
     """Unique model names across strategies, in first-appearance order."""
     names: list[str] = []
     for strategy in spec.strategies:
@@ -98,7 +121,7 @@ def _agent_names(spec: FundSpec) -> list[str]:
     return names
 
 
-def _strategy_kind(strategy: StrategySpec) -> str:
+def strategy_kind(strategy: StrategySpec) -> str:
     """Discretionary pods are staffed entirely by LLM agents; anything with a
     quant model in the mix is systematic. Derived, never declared."""
     if all(issubclass(ALPHA_MODEL_REGISTRY[m.name], LLMAgent)
@@ -184,7 +207,7 @@ def _render_chart(
 _BLOCKS = " ▁▂▃▄▅▆▇█"
 
 
-def _render_area_chart(
+def render_area_chart(
     fund: list[float],
     benchmark: list[float],
     baseline: float,
@@ -262,3 +285,17 @@ def _render_area_chart(
             line.append(char, style=style)
         rows.append(line)
     return rows
+
+
+def cadence_identity(spec: FundSpec) -> str:
+    """How a fund's cadence reads on one line: `weekly`, or `every 30s · 09:30–16:00 ET`."""
+    if not spec.is_intraday:
+        return spec.rebalance
+    return f"{spec.cadence_label} · {spec.window.label}"
+
+
+def session_label(session: str) -> str:
+    """A session for a human: a date as it is, a bar as `2024-06-04 13:05:00 ET`."""
+    if is_intraday(session):
+        return f"{session[:10]} {session[11:]} ET"
+    return session

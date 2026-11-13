@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import time
+from collections import Counter
+from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 import requests
 
@@ -16,9 +21,54 @@ from hedge_fund.data.models import (
     FinancialMetrics,
     InsiderTrade,
     Price,
+    PriceSnapshot,
 )
+from hedge_fund.data.screener import OrderBy, SCREEN_LIMIT, ScreenerFields, ScreenFilter, ScreenRow
+from hedge_fund.data.wallet import payment_session, WALLET_KEY_ENV
 
 logger = logging.getLogger(__name__)
+
+NEWS_PAGE = 10  # the most /news/ returns per request
+API_KEY_ENV = "FINANCIAL_DATASETS_API_KEY"
+# x402 answers only this far back; older dates get a 403 with the window start.
+X402_HISTORY_DAYS = 365
+
+
+def payment_error(resp: requests.Response) -> str:
+    """Why a paid retry still came back 402. The body carries only the
+    generic "Payment required"; the reason (no USDC, a rejected signature,
+    a blocked payer) is the ``error`` field of the base64 JSON in the
+    PAYMENT-REQUIRED header."""
+    header = resp.headers.get("PAYMENT-REQUIRED", "")
+    try:
+        terms = json.loads(base64.b64decode(header + "=" * (-len(header) % 4)))
+    except (ValueError, UnicodeDecodeError):
+        return "no payment terms in the response"
+    return str(terms.get("error") or "no reason given")[:300]
+
+
+def has_data_credential() -> bool:
+    """True when the environment holds something a request can be billed to:
+    an API key, or a wallet to pay per call with x402. The one place that
+    decides it, so the TUI gates and the client cannot disagree."""
+    return bool(os.environ.get(API_KEY_ENV) or os.environ.get(WALLET_KEY_ENV))
+
+
+@dataclass
+class CallMeter:
+    """How many requests actually went to the API, by path.
+
+    Counts attempts: a retry and every pagination page each count once,
+    because each is a billable call on x402. Cache hits never reach the
+    client, so they are never counted. Share one meter across the clients
+    of a run to see what the run cost."""
+
+    calls: int = 0
+    by_path: Counter[str] = field(default_factory=Counter)
+
+    def record(self, url: str) -> None:
+        self.calls += 1
+        self.by_path[urlsplit(url).path] += 1
 
 
 class FDClientError(Exception):
@@ -48,12 +98,31 @@ class FDClient:
     def __init__(
         self,
         api_key: str | None = None,
+        wallet_key: str | None = None,
         timeout: float = 30.0,
+        meter: CallMeter | None = None,
     ) -> None:
-        self._api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY", "")
+        """An API key bills the account; otherwise a wallet key pays each
+        call with x402. Both set means the key wins, which is the API's own
+        rule: a request carrying X-API-KEY is never charged to a wallet.
+        *meter* counts the requests this client sends; pass one meter to
+        every client of a run to count the run."""
+        self._api_key = api_key or os.environ.get(API_KEY_ENV, "")
+        self._wallet_key = wallet_key or os.environ.get(WALLET_KEY_ENV, "")
         self._timeout = timeout
-        self._session = requests.Session()
-        self._session.headers["X-API-Key"] = self._api_key
+        self.meter = meter if meter is not None else CallMeter()
+        if self.pays_per_call():
+            try:
+                self._session = payment_session(self._wallet_key)
+            except ImportError as exc:
+                raise FDClientError(str(exc)) from exc
+        else:
+            self._session = requests.Session()
+            self._session.headers["X-API-Key"] = self._api_key
+
+    def pays_per_call(self) -> bool:
+        """Whether requests go out keyless and pay with x402."""
+        return not self._api_key and bool(self._wallet_key)
 
     # ------------------------------------------------------------------
     # Context manager
@@ -90,6 +159,14 @@ class FDClient:
             "end_date": end_date,
         }, response_key="prices")
         return [Price(**row) for row in data] if data else []
+
+    def get_snapshot(self, ticker: str) -> PriceSnapshot | None:
+        """Fetch the real-time quote. None if the ticker is unknown."""
+        resp = self._request("GET", "/prices/snapshot/", params={"ticker": ticker})
+        if resp is None:
+            return None
+        row = resp.json().get("snapshot")
+        return PriceSnapshot(**row) if row else None
 
     # ------------------------------------------------------------------
     # Financial Metrics
@@ -130,8 +207,10 @@ class FDClient:
         start_date: str | None = None,
         limit: int = 1000,
     ) -> list[CompanyNews]:
-        """Fetch company news."""
-        params: dict = {"ticker": ticker, "end_date": end_date, "limit": limit}
+        """Fetch company news: the newest items first, at most *limit*.
+        /news/ serves no more than NEWS_PAGE per request and rejects a
+        larger ask, so the request is clamped to what it can answer."""
+        params: dict = {"ticker": ticker, "end_date": end_date, "limit": min(limit, NEWS_PAGE)}
         if start_date is not None:
             params["start_date"] = start_date
         data = self._get("/news/", params, response_key="news")
@@ -201,6 +280,47 @@ class FDClient:
         return [EarningsRecord(**row) for row in data] if data else []
 
     # ------------------------------------------------------------------
+    # Screener
+    # ------------------------------------------------------------------
+
+    def screen(
+        self,
+        as_of: str,
+        filters: list[ScreenFilter],
+        *,
+        order_by: OrderBy | None = None,
+        limit: int = SCREEN_LIMIT,
+    ) -> list[ScreenRow]:
+        """The companies that passed *filters* on *as_of*, judged from each
+        one's newest filing made public on or before that date.
+
+        *as_of* is required on purpose: without it the API screens today's
+        numbers, which is lookahead inside a backtest. A 404 raises: this
+        endpoint answers "nothing passed" with an empty list, so a 404 is a
+        missing endpoint or entitlement, not a data fact.
+        """
+        if not as_of:
+            raise ValueError("screen needs an as_of date: a screen without one reads today's numbers")
+        if not filters:
+            raise ValueError("screen needs at least one filter")
+        path = "/financials/search/screener"
+        body: dict = {"as_of": as_of, "filters": [item.model_dump() for item in filters], "limit": limit}
+        if order_by is not None:
+            body["order_by"] = order_by.model_dump()
+        resp = self._request("POST", path, json=body)
+        if resp is None:
+            raise FDClientError(f"POST {path} returned 404", status_code=404, path=path)
+        return [ScreenRow.from_api(row) for row in resp.json().get("results") or []]
+
+    def screener_fields(self) -> ScreenerFields:
+        """The fields, operators, sectors, and industries the screener accepts."""
+        path = "/financials/search/screener/filters"
+        resp = self._request("GET", path)
+        if resp is None:
+            raise FDClientError(f"GET {path} returned 404", status_code=404, path=path)
+        return ScreenerFields.from_api(resp.json())
+
+    # ------------------------------------------------------------------
     # Convenience
     # ------------------------------------------------------------------
 
@@ -241,8 +361,13 @@ class FDClient:
         body = resp.json()
         rows = body.get(response_key)
         next_page_url = body.get("next_page_url")
+        visited = {self._api_url(path)}
         while next_page_url and isinstance(rows, list):
-            resp = self._request("GET", next_page_url)
+            page_url = self._api_url(next_page_url)
+            if page_url in visited:
+                raise FDClientError("pagination repeated a page URL")
+            visited.add(page_url)
+            resp = self._request("GET", page_url)
             if resp is None:
                 break
             body = resp.json()
@@ -250,25 +375,50 @@ class FDClient:
             next_page_url = body.get("next_page_url")
         return rows
 
+    def _api_url(self, path: str) -> str:
+        """Keep the credentialed/payment session on the configured HTTPS origin."""
+        if not isinstance(path, str) or not path or any(ord(c) < 33 for c in path) or "\\" in path:
+            raise FDClientError("invalid API URL")
+        url = self.BASE_URL + path if path.startswith("/") and not path.startswith("//") else path
+        try:
+            parsed, base = urlsplit(url), urlsplit(self.BASE_URL)
+            permitted = (
+                parsed.scheme == base.scheme == "https"
+                and parsed.hostname == base.hostname
+                and (parsed.port or 443) == (base.port or 443)
+                and parsed.username is None and parsed.password is None
+                and not parsed.fragment
+            )
+        except ValueError:
+            permitted = False
+        if not permitted:
+            raise FDClientError("API URL must use the configured HTTPS origin")
+        return url
+
     def _request(
         self,
         method: str,
         path: str,
         **kwargs,
     ) -> requests.Response | None:
-        """HTTP request with retry on 429.
+        """HTTP request with retry on 429 and 503.
 
         Fail-loud contract: raises FDClientError on network errors, HTTP
-        errors, and exhausted rate-limit retries. Returns None ONLY for
-        404 — "this data doesn't exist" is a data fact, not a failure.
-        Silently returning empty on real failures poisons backtests
-        (missing data reads as "no signal").
+        errors, and exhausted retries. Returns None ONLY for 404 — "this
+        data doesn't exist" is a data fact, not a failure. Silently
+        returning empty on real failures poisons backtests (missing data
+        reads as "no signal").
+
+        503 is retried like 429: x402's payment facilitator answers 503 with
+        Retry-After when it is briefly down, and nothing is charged for it.
 
         *path* may be an absolute URL (a ``next_page_url`` from a previous
-        response), which is requested verbatim.
+        response), which must stay on the configured HTTPS origin.
         """
-        url = path if path.startswith("http") else self.BASE_URL + path
+        url = self._api_url(path)
+        kwargs["allow_redirects"] = False
         for attempt, delay in enumerate((*self._RETRY_DELAYS, None)):
+            self.meter.record(url)
             try:
                 resp = self._session.request(
                     method, url, timeout=self._timeout, **kwargs,
@@ -278,26 +428,34 @@ class FDClient:
                     f"{method} {path} failed: {exc}", path=path,
                 ) from exc
 
-            if resp.status_code == 429 and delay is not None:
+            if resp.status_code in (429, 503) and delay is not None:
                 logger.info(
-                    "Rate limited (429), retrying in %ds (attempt %d/%d)",
-                    delay, attempt + 1, len(self._RETRY_DELAYS),
+                    "Got %d, retrying in %ds (attempt %d/%d)",
+                    resp.status_code, delay, attempt + 1, len(self._RETRY_DELAYS),
                 )
                 time.sleep(delay)
                 continue
+
+            if 300 <= resp.status_code < 400:
+                raise FDClientError("API redirects are not allowed", status_code=resp.status_code)
 
             if resp.status_code == 404:
                 return None
 
             if resp.status_code >= 400:
-                raise FDClientError(
-                    f"{method} {path} returned {resp.status_code}: {resp.text[:200]}",
-                    status_code=resp.status_code, path=path,
-                )
+                message = f"{method} {path} returned {resp.status_code}: {resp.text[:200]}"
+                if resp.status_code == 402 and self.pays_per_call():
+                    message += f" (x402 payment from the wallet failed: {payment_error(resp)})"
+                if resp.status_code == 403 and self.pays_per_call():
+                    message += (
+                        f" (x402 serves the last {X402_HISTORY_DAYS} days; move the start "
+                        f"date later or set {API_KEY_ENV} for older data)"
+                    )
+                raise FDClientError(message, status_code=resp.status_code, path=path)
 
             return resp
 
         raise FDClientError(
-            f"{method} {path} rate limited (429) after {len(self._RETRY_DELAYS)} retries",
-            status_code=429, path=path,
+            f"{method} {path} returned {resp.status_code} after {len(self._RETRY_DELAYS)} retries",
+            status_code=resp.status_code, path=path,
         )

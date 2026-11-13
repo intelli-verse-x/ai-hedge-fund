@@ -1,17 +1,16 @@
 """Week 1 data exploration — pull and inspect FD data for 5 tickers."""
 
-import os
 import pytest
 
-from hedge_fund.data import FDClient
+from hedge_fund.data import FDClient, has_data_credential
 
 TICKERS = ["AAPL", "MSFT", "NVDA", "JPM", "XOM"]
 PRICE_START = "2024-01-01"
 PRICE_END = "2026-04-15"
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("FINANCIAL_DATASETS_API_KEY"),
-    reason="live Financial Datasets smoke tests require FINANCIAL_DATASETS_API_KEY",
+    not has_data_credential(),
+    reason="live Financial Datasets smoke tests require FINANCIAL_DATASETS_API_KEY or X402_WALLET_PRIVATE_KEY",
 )
 
 
@@ -27,6 +26,12 @@ def test_prices(fd: FDClient, ticker: str) -> None:
     assert len(prices) > 0, f"No prices for {ticker}"
     dates = [p.time for p in prices]
     print(f"  {ticker} prices: {len(prices)} bars  [{dates[0]} → {dates[-1]}]")
+
+
+def test_snapshot(fd: FDClient) -> None:
+    snap = fd.get_snapshot("AAPL")
+    assert snap is not None and snap.price > 0
+    print(f"  AAPL snapshot: {snap.price} @ {snap.time}")
 
 
 @pytest.mark.parametrize("ticker", TICKERS)
@@ -94,3 +99,21 @@ def test_earnings_history(fd: FDClient, ticker: str) -> None:
     print(f"  {ticker} earnings history: {len(records)} records")
     for r in records:
         print(f"    {r.report_period}  {r.source_type:5s}  {r.filing_date}  q={'yes' if r.quarterly else 'no'}  a={'yes' if r.annual else 'no'}")
+
+
+def test_screen_point_in_time(fd: FDClient) -> None:
+    from hedge_fund.data import ScreenFilter
+    as_of = "2026-08-06"
+    rows = fd.screen(as_of, [ScreenFilter(field="market_cap", operator="gt", value=1e9)])
+    assert len(rows) > 1000, f"only {len(rows)} names above $1B as of {as_of}"
+    assert all(r.filing_date <= as_of for r in rows), "a filing from after as_of answered"
+    assert all("market_cap" in r.values for r in rows)
+    print(f"  screen as of {as_of}: {len(rows)} names above $1B, newest filing {max(r.filing_date for r in rows)}")
+
+
+def test_screener_fields(fd: FDClient) -> None:
+    fields = fd.screener_fields()
+    assert {"market_cap", "pe_ratio", "revenue_growth"} <= fields.numeric
+    assert "Financials" in fields.sectors and "Banks" in fields.industries
+    assert "stock_price" in fields.unavailable_as_of
+    print(f"  screener vocabulary: {len(fields.numeric)} numeric fields, {len(fields.sectors)} sectors, {len(fields.industries)} industries")
